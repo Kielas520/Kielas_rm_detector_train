@@ -68,9 +68,6 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
             invalid_targets = 0
             target_issues = []
             
-            # 用于收集当前图片中出现的所有目标状态，以便统一写在左上角
-            image_target_statuses = set()
-            
             with label_path.open('r') as f:
                 lines = f.readlines()
                 if not lines:
@@ -104,8 +101,6 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                         
                         if is_valid:
                             valid_targets += 1
-                            target_class_idx = int(parts[0]) 
-                            
                             box_color = (0, 255, 0)
                             info_text = ""
                             
@@ -113,36 +108,38 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                                 if flag_type == 0:
                                     if flag_val == 0:
                                         box_color = (0, 0, 255) 
-                                        info_text = f"{flag_val}(Red)"
+                                        info_text = f"Red"
                                     elif flag_val == 1:
                                         box_color = (255, 0, 0)
-                                        info_text = f"{flag_val}(Blue)"
+                                        info_text = f"Blue"
                                     else:
-                                        info_text = f"color:{flag_val}"
-                                        
+                                        info_text = f"c:{flag_val}"
                                 elif flag_type == 1:
-                                    if flag_val == 0:
-                                        info_text = f"{flag_val}(Inv)"
-                                    elif flag_val == 1:
-                                        info_text = f"{flag_val}(Vague)"
-                                    elif flag_val == 3:
-                                        info_text = f"{flag_val}(Full)"
-                                    else:
-                                        info_text = f"status:{flag_val}"
+                                    if flag_val == 0: info_text = "Inv"
+                                    elif flag_val == 1: info_text = "Vague"
+                                    elif flag_val == 2: info_text = "Full"
+                                    else: info_text = f"s:{flag_val}"
 
-                            # 收集当前目标的状态信息供全局显示
-                            target_label = f"{info_text}" if info_text else ""
-                            image_target_statuses.add(target_label)
-
-                            # 绘制目标线段
+                            # 1. 绘制目标线段 (左右垂直边缘)
                             cv2.line(img, pts[1], pts[0], box_color, 2)
                             cv2.line(img, pts[3], pts[2], box_color, 2)
                             
-                            # 绘制绝对干净的坐标点，只有 (x,y)
+                            # 2. 绘制各角点坐标
                             for p in pts:
                                 cv2.circle(img, p, 4, box_color, -1)
                                 cv2.putText(img, f"({p[0]},{p[1]})", (p[0] + 5, p[1] - 5), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+
+                            # 3. 在每个目标左上方绘制 ID 和 状态信息
+                            # 计算目标的左上角位置 (取所有点的最小x和最小y)
+                            min_x = min(p[0] for p in pts)
+                            min_y = min(p[1] for p in pts)
+                            
+                            target_label = f"id:{class_id} {info_text}" if info_text else f"id:{class_id}"
+                            
+                            # 绘制文字，位置稍微向上偏移 10 像素以防覆盖线段
+                            cv2.putText(img, target_label, (min_x, min_y - 10), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
                         else:
                             invalid_targets += 1
                             
@@ -152,14 +149,6 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                     log_entry += "\n"
 
         log_contents.append(log_entry)
-
-        # 汇总当前图片中所有的目标状态，并将其绘制在图片的全局左上角
-        status_info = " | ".join(sorted(list(image_target_statuses)))
-        status_str = f"id:{class_id} | {status_info}"
-        
-        cv2.putText(img, status_str, (15, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
-
         out_img_path = output_dir / f"{class_id}_{img_path.name}"
         cv2.imwrite(str(out_img_path), img)
 
@@ -170,4 +159,5 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
     print(f"结果图片及日志已保存至: {output_dir.absolute()}")
 
 # 调用示例
-visualize_dataset("./data", "augment", if_flag=[1, 1])
+if __name__ == "__main__":
+    visualize_dataset("./data", "augment", if_flag=[1, 1])
