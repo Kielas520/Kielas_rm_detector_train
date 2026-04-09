@@ -9,7 +9,7 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
     type_dir = root / data_type
     
     # 定义输出文件夹路径
-    output_dir = root / f"{data_type}_visualized_samples"
+    output_dir = root / "visualized_samples" / f"{data_type}"
     
     if not type_dir.exists():
         print(f"错误: 找不到目录 {type_dir}")
@@ -140,4 +140,4 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
     print(f"请查看 {log_file_path.name} 获取数据完整性记录。")
 
 # 调用示例 (if_color=True 代表按照含有颜色标志位解析)
-visualize_dataset("./data", "raw", if_color=True)
+visualize_dataset("./data", "augment", if_color=False)

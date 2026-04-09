@@ -5,6 +5,7 @@ from pathlib import Path
 from queue import Queue
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
+import yaml
 
 # 引入 rich 组件
 from rich.console import Console
