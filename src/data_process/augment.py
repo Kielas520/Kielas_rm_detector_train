@@ -153,16 +153,44 @@ def process_data(img, labels, brightness_range, occ_radius_pct=0.2):
         # 统一计算遮挡对可见度的影响
         if occ_boxes:
             for lab in aug_labels:
+                # 1. 保留原有的点遮挡判断（作为基础辅助）
                 covered_points = 0
                 for pt in lab['pts']:
                     px, py = pt[0], pt[1]
-                    # 判断当前关键点是否落在任意一个遮挡矩形框内
                     if any(x1 <= px <= x2 and y1 <= py <= y2 for x1, y1, x2, y2 in occ_boxes):
                         covered_points += 1
+
+                # 2. 新增：基于目标外接矩形(Bounding Box)的面积遮挡判断
+                pts = lab['pts']
+                min_x, min_y = np.min(pts, axis=0)
+                max_x, max_y = np.max(pts, axis=0)
+                target_area = (max_x - min_x) * (max_y - min_y)
                 
-                if covered_points == 4:
+                is_heavily_occluded = False
+                is_partially_occluded = False
+
+                if target_area > 0:
+                    for x1, y1, x2, y2 in occ_boxes:
+                        # 计算遮挡块与目标 Bbox 的交集区域
+                        ix1 = max(min_x, x1)
+                        iy1 = max(min_y, y1)
+                        ix2 = min(max_x, x2)
+                        iy2 = min(max_y, y2)
+                        
+                        if ix1 < ix2 and iy1 < iy2:
+                            inter_area = (ix2 - ix1) * (iy2 - iy1)
+                            overlap_ratio = inter_area / target_area
+                            
+                            # 可以根据实际需求调整阈值
+                            if overlap_ratio > 0.7:  # 遮挡超过 70% 视为完全遮挡
+                                is_heavily_occluded = True
+                            elif overlap_ratio > 0.1:  # 遮挡超过 10% 视为部分遮挡
+                                is_partially_occluded = True
+
+                # 综合判定可见度
+                if covered_points == 4 or is_heavily_occluded:
                     lab['vis'] = 0
-                elif covered_points > 0:
+                elif covered_points > 0 or is_partially_occluded:
                     lab['vis'] = min(lab['vis'], 1)
         
     return aug_img, aug_labels
