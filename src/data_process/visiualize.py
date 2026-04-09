@@ -3,30 +3,25 @@ import cv2
 import shutil
 from pathlib import Path
 
-def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool = True):
-    # 1. 初始化路径对象
+def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = None):
+    if if_flag is None:
+        if_flag = [0, 0]
+        
     root = Path(root_path)
     type_dir = root / data_type
-    
-    # 定义输出文件夹路径
     output_dir = root / "visualized_samples" / f"{data_type}"
     
     if not type_dir.exists():
         print(f"错误: 找不到目录 {type_dir}")
         return
 
-    # 刷新文件夹（清空旧数据）
     if output_dir.exists():
         shutil.rmtree(output_dir)
         print(f"已清理旧的输出文件夹: {output_dir.name}")
 
-    # 创建新的输出文件夹
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 定义日志文件路径
     log_file_path = output_dir / "sample_log.txt"
 
-    # 2. 收集所有图片和对应的标签路径
     all_data = []
     class_dirs = [d for d in type_dir.iterdir() if d.is_dir()]
     
@@ -46,18 +41,18 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
         print(f"在 {type_dir} 下未发现任何图片")
         return
 
-    # 3. 抽样 12 张图片
     sample_size = min(12, len(all_data))
     sampled_data = random.sample(all_data, sample_size)
     
-    # 初始化日志内容
+    has_flag = (if_flag[0] == 1)
+    flag_type = if_flag[1] 
+    
     log_contents = [
         f"抽样数据分析日志 (共抽样 {sample_size} 张)\n",
-        f"设置: if_color={if_color}\n",
+        f"设置: if_flag={if_flag} (是否包含标志位: {has_flag}, 标志位含义: {'颜色' if flag_type == 0 else '可见度' if flag_type == 1 else '无'})\n",
         "-" * 50 + "\n"
     ]
     
-    # 4. 遍历抽样数据进行绘制、记录并保存
     for img_path, label_path, class_id in sampled_data:
         img = cv2.imread(str(img_path))
         if img is None:
@@ -73,6 +68,9 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
             invalid_targets = 0
             target_issues = []
             
+            # 用于收集当前图片中出现的所有目标状态，以便统一写在左上角
+            image_target_statuses = set()
+            
             with label_path.open('r') as f:
                 lines = f.readlines()
                 if not lines:
@@ -81,11 +79,13 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
                     for line_idx, line in enumerate(lines):
                         parts = list(map(float, line.split()))
                         
-                        # 检查数据完整性并提取坐标
                         is_valid = False
-                        if if_color:
+                        flag_val = None
+                        
+                        if has_flag:
                             if len(parts) >= 10:
                                 is_valid = True
+                                flag_val = int(parts[1])
                                 pts = [
                                     (int(parts[2]), int(parts[3])), (int(parts[4]), int(parts[5])), 
                                     (int(parts[6]), int(parts[7])), (int(parts[8]), int(parts[9]))
@@ -104,18 +104,48 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
                         
                         if is_valid:
                             valid_targets += 1
-                            # 绘制目标框和坐标点
-                            cv2.line(img, pts[1], pts[0], (0, 255, 0), 2)
-                            cv2.line(img, pts[3], pts[2], (0, 255, 0), 2)
+                            target_class_idx = int(parts[0]) 
+                            
+                            box_color = (0, 255, 0)
+                            info_text = ""
+                            
+                            if has_flag:
+                                if flag_type == 0:
+                                    if flag_val == 0:
+                                        box_color = (0, 0, 255) 
+                                        info_text = f"{flag_val}(Red)"
+                                    elif flag_val == 1:
+                                        box_color = (255, 0, 0)
+                                        info_text = f"{flag_val}(Blue)"
+                                    else:
+                                        info_text = f"color:{flag_val}"
+                                        
+                                elif flag_type == 1:
+                                    if flag_val == 0:
+                                        info_text = f"{flag_val}(Inv)"
+                                    elif flag_val == 1:
+                                        info_text = f"{flag_val}(Vague)"
+                                    elif flag_val == 3:
+                                        info_text = f"{flag_val}(Full)"
+                                    else:
+                                        info_text = f"status:{flag_val}"
+
+                            # 收集当前目标的状态信息供全局显示
+                            target_label = f"{info_text}" if info_text else ""
+                            image_target_statuses.add(target_label)
+
+                            # 绘制目标线段
+                            cv2.line(img, pts[1], pts[0], box_color, 2)
+                            cv2.line(img, pts[3], pts[2], box_color, 2)
+                            
+                            # 绘制绝对干净的坐标点，只有 (x,y)
                             for p in pts:
-                                cv2.circle(img, p, 4, (255, 0, 0), -1)
-                                coord_text = f"({p[0]},{p[1]})"
-                                cv2.putText(img, coord_text, (p[0] + 5, p[1] - 5), 
+                                cv2.circle(img, p, 4, box_color, -1)
+                                cv2.putText(img, f"({p[0]},{p[1]})", (p[0] + 5, p[1] - 5), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
                         else:
                             invalid_targets += 1
                             
-                    # 汇总当前图像的日志
                     log_entry += f"正常目标数: {valid_targets}, 异常目标数: {invalid_targets}"
                     if target_issues:
                         log_entry += f" | 异常明细: {', '.join(target_issues)}"
@@ -123,21 +153,21 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
 
         log_contents.append(log_entry)
 
-        # 标注类别信息
-        cv2.putText(img, f"Class: {class_id}", (15, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+        # 汇总当前图片中所有的目标状态，并将其绘制在图片的全局左上角
+        status_info = " | ".join(sorted(list(image_target_statuses)))
+        status_str = f"id:{class_id} | {status_info}"
+        
+        cv2.putText(img, status_str, (15, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
 
-        # 保存处理后的图像
         out_img_path = output_dir / f"{class_id}_{img_path.name}"
         cv2.imwrite(str(out_img_path), img)
 
-    # 5. 将日志写入到文本文件
     with log_file_path.open('w', encoding='utf-8') as log_f:
         log_f.writelines(log_contents)
 
     print(f"成功抽样并处理 {sample_size} 张图片。")
     print(f"结果图片及日志已保存至: {output_dir.absolute()}")
-    print(f"请查看 {log_file_path.name} 获取数据完整性记录。")
 
-# 调用示例 (if_color=True 代表按照含有颜色标志位解析)
-visualize_dataset("./data", "augment", if_color=False)
+# 调用示例
+visualize_dataset("./data", "augment", if_flag=[1, 1])
