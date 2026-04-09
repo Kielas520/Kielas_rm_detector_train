@@ -5,22 +5,27 @@ from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
-# 引入 rich 组件
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 from rich.table import Table
 from rich.panel import Panel
+from rich.progress import ProgressColumn
+from rich.text import Text
 
 console = Console()
+
+class MofNCompleteColumn(ProgressColumn):
+    def render(self, task):
+        completed = int(task.completed)
+        total = int(task.total) if task.total is not None else "?"
+        return Text(f"{completed}/{total}", style="progress.remaining")
 
 def calculate_distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     """计算两点之间的欧式距离"""
     return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
 def get_frame_center(lines: List[str], expected_class_id: str) -> Tuple[Optional[Tuple[float, float]], str]:
-    """
-    解析标签并计算当前帧的综合中心点。
-    """
+    """解析标签并计算当前帧的综合中心点。"""
     centers = []
     try:
         expected_id_int = int(expected_class_id)
@@ -40,7 +45,6 @@ def get_frame_center(lines: List[str], expected_class_id: str) -> Tuple[Optional
             return None, "ID_ERROR"
 
         try:
-            # 假设格式: class_id prob x1 y1 x2 y2 x3 y3 x4 y4
             coords = [float(x) for x in parts[2:10]]
             center_x = sum(coords[0::2]) / 4.0
             center_y = sum(coords[1::2]) / 4.0
@@ -56,9 +60,7 @@ def get_frame_center(lines: List[str], expected_class_id: str) -> Tuple[Optional
     return (avg_x, avg_y), "OK"
 
 def io_worker(task_queue: Queue, progress: Progress, task_id):
-    """
-    后台工作线程：专职处理耗时的文件读写操作
-    """
+    """后台工作线程：专职处理耗时的文件读写操作"""
     while True:
         task = task_queue.get()
         if task is None:
@@ -67,14 +69,11 @@ def io_worker(task_queue: Queue, progress: Progress, task_id):
             
         out_labels_dir, label_filename, lines, photo_file, out_photos_dir = task
         
-        # 1. 写入新的 label 文件
         with open(out_labels_dir / label_filename, 'w', encoding='utf-8') as f:
             f.writelines(lines)
             
-        # 2. 复制图片文件
         shutil.copy2(photo_file, out_photos_dir / photo_file.name)
         
-        # 更新 rich 进度条
         progress.advance(task_id)
         task_queue.task_done()
 
@@ -111,12 +110,19 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         TaskProgressColumn(),
-        MofNCompleteColumn(), # 自定义列显示 n/m
+        MofNCompleteColumn(),
         TimeRemainingColumn(),
         console=console
     )
 
-    stats = {"id_error": 0, "distance_skipped": 0, "format_error": 0, "missing_photo": 0, "saved": 0}
+    stats = {
+        "id_error": 0, 
+        "distance_skipped": 0, 
+        "format_error": 0, 
+        "missing_photo": 0, 
+        "empty_label": 0,  # 新增：空标签统计
+        "saved": 0
+    }
     io_queue = Queue(maxsize=1000)
 
     with progress:
@@ -142,27 +148,7 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
             last_saved_center = None
 
             for label_file in labels:
-                with open(label_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-
-                current_center, status = get_frame_center(lines, expected_class_id)
-
-                if status == "ID_ERROR":
-                    stats["id_error"] += 1
-                    progress.advance(main_task)
-                    continue
-                elif status not in ["OK", "EMPTY"]:
-                    stats["format_error"] += 1
-                    progress.advance(main_task)
-                    continue
-
-                if status == "OK" and last_saved_center is not None:
-                    distance = calculate_distance(current_center, last_saved_center)
-                    if distance < distance_threshold:
-                        stats["distance_skipped"] += 1
-                        progress.advance(main_task)
-                        continue
-
+                # 检查图片是否存在
                 photo_file = None
                 for ext in ['.jpg', '.png', '.jpeg']:
                     temp_photo = photos_dir / (label_file.stem + ext)
@@ -170,14 +156,52 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
                         photo_file = temp_photo
                         break
                 
-                if photo_file:
-                    io_queue.put((out_labels_dir, label_file.name, lines, photo_file, out_photos_dir))
-                    stats["saved"] += 1
-                    if current_center:
-                        last_saved_center = current_center
-                else:
+                if not photo_file:
                     stats["missing_photo"] += 1
                     progress.advance(main_task)
+                    continue
+
+                # 读取标签文件
+                with open(label_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+
+                # ==========================================
+                # 修改点：拦截全空文件或只包含空白符的文件
+                # ==========================================
+                if not lines or all(line.strip() == '' for line in lines):
+                    stats["empty_label"] += 1
+                    progress.advance(main_task)
+                    continue
+
+                current_center, status = get_frame_center(lines, expected_class_id)
+
+                # ==========================================
+                # 修改点：明确拦截解析结果为 EMPTY 的情况
+                # ==========================================
+                if status == "EMPTY":
+                    stats["empty_label"] += 1
+                    progress.advance(main_task)
+                    continue
+                elif status == "ID_ERROR":
+                    stats["id_error"] += 1
+                    progress.advance(main_task)
+                    continue
+                elif status != "OK":
+                    stats["format_error"] += 1
+                    progress.advance(main_task)
+                    continue
+
+                if last_saved_center is not None:
+                    distance = calculate_distance(current_center, last_saved_center)
+                    if distance < distance_threshold:
+                        stats["distance_skipped"] += 1
+                        progress.advance(main_task)
+                        continue
+
+                # 验证均通过，推入队列保存
+                io_queue.put((out_labels_dir, label_file.name, lines, photo_file, out_photos_dir))
+                stats["saved"] += 1
+                last_saved_center = current_center
 
         # 4. 收尾
         for _ in range(num_workers):
@@ -185,7 +209,7 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
         for t in workers:
             t.join()
 
-    # 5. 打印美化的统计报告
+    # 5. 打印报告
     print_report(total_files, stats)
 
 def print_report(total, stats):
@@ -202,20 +226,11 @@ def print_report(total, stats):
     add_row("ID 匹配错误", stats['id_error'], "red")
     add_row("距离过滤 (跳过)", stats['distance_skipped'], "yellow")
     add_row("格式解析错误", stats['format_error'], "red")
-    add_row("图片缺失", stats['missing_photo'], "red")
+    add_row("图片缺失 (被忽略)", stats['missing_photo'], "red")
+    add_row("空标签 (被忽略)", stats['empty_label'], "red")
 
     console.print("\n")
     console.print(Panel(table, expand=False, border_style="cyan", title="✨ 清洗完成"))
-
-# 自定义进度条显示 n/m 格式
-from rich.progress import ProgressColumn
-from rich.text import Text
-
-class MofNCompleteColumn(ProgressColumn):
-    def render(self, task):
-        completed = int(task.completed)
-        total = int(task.total) if task.total is not None else "?"
-        return Text(f"{completed}/{total}", style="progress.remaining")
 
 if __name__ == "__main__":
     purify_dataset_pipeline(
