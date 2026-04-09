@@ -43,6 +43,7 @@ def source_env(script_path):
 
 class RosBagExtractor:
     def __init__(self):
+        # 对应关系：文件夹名 -> 机器人ID
         self.folder_map = {
             "hero_blue_data": 0, "infantry_blue_data": 2, "sentry_blue_data": 5,
             "hero_red_data": 6, "infantry_red_data": 8, "sentry_red_data": 11
@@ -53,23 +54,38 @@ class RosBagExtractor:
 
     @staticmethod
     def process_single_bag(folder_name, target_id, progress_queue, task_id, original_dir, raw_data_dir):
-        """基于精确时间戳的 O(1) 匹配提取"""
+        """带有刷新逻辑和错误统计的提取逻辑"""
+        # 屏蔽 ROS2 底层冗余日志
         os.environ['RCUTILS_CONSOLE_OUTPUT_FORMAT'] = ''
         os.environ['RCL_LOG_LEVEL'] = '40' 
+        
+        # 延迟导入自定义消息，避免多进程初始化冲突
         from rm_interfaces.msg import ArmorsDebugMsg
+        
+        stats = {"empty_pts": 0, "invalid_pts": 0, "match_fail": 0, "valid_frames": 0}
         
         bag_path = original_dir / folder_name
         if not bag_path.exists():
-            progress_queue.put({"task_id": task_id, "type": "description", "value": "[red]目录缺失"})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": "[red]目录缺失", "stats": stats})
             progress_queue.put({"task_id": task_id, "type": "done"})
             return
 
-        # 准备目录
+        # --- 刷新逻辑：如果旧的 raw 存在则删除 ---
         base_id_dir = raw_data_dir / str(target_id)
-        if base_id_dir.exists(): shutil.rmtree(base_id_dir)
-        base_id_dir.mkdir(parents=True, exist_ok=True)
-        photo_dir, label_dir = base_id_dir / "photos", base_id_dir / "labels"
-        photo_dir.mkdir(); label_dir.mkdir()
+        try:
+            if base_id_dir.exists():
+                progress_queue.put({"task_id": task_id, "type": "description", "value": "[yellow]清理旧数据...", "stats": stats})
+                shutil.rmtree(base_id_dir)
+            
+            # 重新创建目录结构
+            photo_dir = base_id_dir / "photos"
+            label_dir = base_id_dir / "labels"
+            photo_dir.mkdir(parents=True, exist_ok=True)
+            label_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]刷新失败: {str(e)[:10]}", "stats": stats})
+            progress_queue.put({"task_id": task_id, "type": "done"})
+            return
 
         bridge = CvBridge()
         storage_options = rosbag2_py.StorageOptions(uri=str(bag_path), storage_id='sqlite3')
@@ -79,13 +95,12 @@ class RosBagExtractor:
             reader = rosbag2_py.SequentialReader()
             reader.open(storage_options, converter_options)
             
-            # 1. 快速扫描获取图像总数
             metadata = reader.get_metadata()
             total_images = next((t.message_count for t in metadata.topics_with_message_count if t.topic_metadata.name == '/detector/img_debug'), 0)
             progress_queue.put({"task_id": task_id, "type": "total", "value": total_images})
-            progress_queue.put({"task_id": task_id, "type": "description", "value": "正在加载标签字典..."})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": "[cyan]正在同步...", "stats": stats})
 
-            # 2. 读取所有标签并建立哈希表 (字典)
+            # 1. 读取并索引标签 (Topic: /detector/armors_debug_info)
             label_map = {}
             reader.set_filter(rosbag2_py.StorageFilter(topics=['/detector/armors_debug_info']))
             
@@ -94,17 +109,23 @@ class RosBagExtractor:
                 msg = deserialize_message(data, ArmorsDebugMsg)
                 t_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
                 
-                armors = [{'id': a.armor_id, 'color': a.color, 'pts': [a.l_light_up_dx, a.l_light_up_dy, a.l_light_down_dx, a.l_light_down_dy, a.r_light_up_dx, a.r_light_up_dy, a.r_light_down_dx, a.r_light_down_dy]} for a in msg.armors_debug]
-                label_map[t_ns] = armors
+                armors = []
+                for a in msg.armors_debug:
+                    pts = [a.l_light_up_dx, a.l_light_up_dy,
+                           a.l_light_down_dx, a.l_light_down_dy, 
+                           a.r_light_up_dx, a.r_light_up_dy, a.r_light_down_dx, a.r_light_down_dy]
+                    
+                    # 简单过滤空标签
+                    if all(p == 0 for p in pts[:4]):
+                        stats["empty_pts"] += 1
+                        continue
+                    
+                    armors.append({'id': a.armor_id, 'color': a.color, 'pts': pts})
+                
+                if armors:
+                    label_map[t_ns] = armors
 
-            if not label_map:
-                progress_queue.put({"task_id": task_id, "type": "description", "value": "[yellow]无有效标签"})
-                progress_queue.put({"task_id": task_id, "type": "done"})
-                return
-
-            progress_queue.put({"task_id": task_id, "type": "description", "value": "正在精确匹配导出图像..."})
-
-            # 3. 重新打开读取图像流，直接用时间戳查字典
+            # 2. 导出图像并进行时间戳匹配 (Topic: /detector/img_debug)
             reader = rosbag2_py.SequentialReader()
             reader.open(storage_options, converter_options)
             reader.set_filter(rosbag2_py.StorageFilter(topics=['/detector/img_debug']))
@@ -115,7 +136,6 @@ class RosBagExtractor:
                 msg = deserialize_message(data, Image)
                 img_t = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
                 
-                # 精确查字典匹配
                 if img_t in label_map:
                     cv_img = bridge.imgmsg_to_cv2(msg, "bgr8")
                     name = f"{img_count:06d}"
@@ -123,24 +143,30 @@ class RosBagExtractor:
                     
                     with open(label_dir / f"{name}.txt", 'w') as f:
                         for a in label_map[img_t]:
-                            f.write(f"{a['id']} {a['color']} {' '.join(map(str, a['pts']))}\n")
+                            pts_str = ' '.join(map(str, a['pts']))
+                            f.write(f"{a['id']} {a['color']} {pts_str}\n")
                     img_count += 1
+                    stats["valid_frames"] = img_count
+                else:
+                    stats["match_fail"] += 1
                 
                 batch += 1
-                if batch >= 20:
-                    progress_queue.put({"task_id": task_id, "type": "advance", "value": batch})
+                if batch >= 20: # 每20帧更新一次UI，减少进程间通信开销
+                    progress_queue.put({"task_id": task_id, "type": "advance", "value": batch, "stats": stats})
                     batch = 0
 
-            progress_queue.put({"task_id": task_id, "type": "advance", "value": batch})
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]完成 ({img_count}帧)"})
+            progress_queue.put({"task_id": task_id, "type": "advance", "value": batch, "stats": stats})
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[green]提取完成", "stats": stats})
             progress_queue.put({"task_id": task_id, "type": "done"})
             
         except Exception as e:
-            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]错误: {str(e)[:20]}"})
+            # 临时增加打印完整异常，方便定位
+            print(f"\n[Error Details] {repr(e)}") 
+            progress_queue.put({"task_id": task_id, "type": "description", "value": f"[red]异常: {str(e)[:15]}", "stats": stats})
             progress_queue.put({"task_id": task_id, "type": "done"})
 
     def extract(self):
-        console.print(f"[bold green]ROS2 数据同步提取器 (精确匹配模式)[/bold green]")
+        console.print(f"[bold green]ROS2 数据同步提取器 (自动刷新模式)[/bold green]")
         manager = multiprocessing.Manager()
         progress_queue = manager.Queue()
 
@@ -148,10 +174,12 @@ class RosBagExtractor:
             SpinnerColumn(),
             TextColumn("[bold blue]{task.fields[name]}"),
             TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=30),
+            BarColumn(bar_width=25),
             TaskProgressColumn(),
+            TextColumn("[red]空标:{task.fields[empty]}"),
+            TextColumn("[yellow]丢弃:{task.fields[fail]}"),
             TimeRemainingColumn(),
-            refresh_per_second=5
+            refresh_per_second=10
         )
 
         def update_ui():
@@ -159,25 +187,46 @@ class RosBagExtractor:
                 msg = progress_queue.get()
                 if msg is None: break
                 tid = msg['task_id']
+                
+                if 'stats' in msg:
+                    progress.update(tid, empty=msg['stats']['empty_pts'], fail=msg['stats']['match_fail'])
+                
                 if msg['type'] == 'total': progress.update(tid, total=msg['value'])
                 elif msg['type'] == 'advance': progress.advance(tid, advance=msg['value'])
                 elif msg['type'] == 'description': progress.update(tid, description=msg['value'])
                 elif msg['type'] == 'done': progress.update(tid, completed=progress.tasks[tid].total or 1)
 
         with progress:
-            task_ids = {name: progress.add_task("就绪", name=f"{name:<20}", total=None) for name in self.folder_map.keys()}
-            ui_thread = threading.Thread(target=update_ui, daemon=True); ui_thread.start()
+            task_ids = {}
+            for name in self.folder_map.keys():
+                tid = progress.add_task("就绪", name=f"{name:<18}", total=None, empty=0, fail=0)
+                task_ids[name] = tid
 
-            with ProcessPoolExecutor(max_workers=6) as executor:
-                futures = [executor.submit(self.process_single_bag, n, tid, progress_queue, task_ids[n], self.original_dir, self.raw_data_dir) for n, tid in self.folder_map.items()]
+            ui_thread = threading.Thread(target=update_ui, daemon=True)
+            ui_thread.start()
+
+            # 使用多进程并行处理多个 Bag
+            with ProcessPoolExecutor(max_workers=min(len(self.folder_map), multiprocessing.cpu_count())) as executor:
+                futures = [
+                    executor.submit(
+                        self.process_single_bag, 
+                        n, 
+                        self.folder_map[n], 
+                        progress_queue, 
+                        task_ids[n], 
+                        self.original_dir, 
+                        self.raw_data_dir
+                    ) for n in self.folder_map.keys()
+                ]
                 for f in futures: f.result()
 
-            progress_queue.put(None); ui_thread.join()
+            progress_queue.put(None)
+            ui_thread.join()
 
 if __name__ == '__main__':
-    # 环境配置
     source_path = "~/DT46_V/install/setup.bash"
 
+    # 环境检查与重载
     if "DT46_V" not in os.environ.get("LD_LIBRARY_PATH", ""):
         source_env(source_path)
         os.execv(sys.executable, ['python3'] + sys.argv)

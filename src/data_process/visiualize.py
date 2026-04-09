@@ -140,4 +140,4 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_color: bool =
     print(f"请查看 {log_file_path.name} 获取数据完整性记录。")
 
 # 调用示例 (if_color=True 代表按照含有颜色标志位解析)
-visualize_dataset("./data", "purify", if_color=True)
+visualize_dataset("./data", "raw", if_color=True)
