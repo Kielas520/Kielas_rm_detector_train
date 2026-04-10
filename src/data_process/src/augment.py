@@ -51,7 +51,6 @@ class AugmentConfig:
     bg_replace_prob: float = 0.3          # 触发概率
     bg_dir: str = "./background"          # 背景图文件夹路径
     bg_radius_factor: float = 1.3         # 约束圆半径放大系数 (1.0表示刚好包住最远角点)
-    bg_blur_ksize: int = 31               # 掩膜边缘平滑度(必须是奇数)
 
     # 遮挡
     occ_prob: float = 0.5
@@ -158,7 +157,7 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
         for lab in aug_labels:
             if random.random() < 0.5: 
                 center = np.mean(lab['pts'], axis=0).astype(int)
-                cv2.circle(bloom_layer, tuple(center), int(min(h, w) * 0.05), (255, 255, 255), -1)
+                cv2.circle(bloom_layer, tuple(center), int(min(h, w) * 0.02), (255, 255, 255), -1)
         bloom_layer = cv2.GaussianBlur(bloom_layer, (0, 0), sigmaX=15)
         aug_img = np.clip(aug_img.astype(np.float32) + bloom_layer, 0, 255).astype(np.uint8)
 
@@ -234,7 +233,7 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
         if center_x < 0 or center_x >= w or center_y < 0 or center_y >= h:
             lab['vis'] = 0
 
-    # ================= 4. 随机背景替换 (约束圆掩膜) =================
+    # ================= 4. 随机背景替换 (亮度均衡 + 动态 Ksize 版) =================
     if aug_labels and bg_paths and random.random() < cfg.bg_replace_prob:
         bg_path = random.choice(bg_paths)
         bg_img = cv2.imread(str(bg_path))
@@ -243,6 +242,9 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
             bg_img = cv2.resize(bg_img, (w, h))
             mask = np.zeros((h, w), dtype=np.float32)
             
+            # 记录所有目标的半径，用于计算动态 Ksize
+            all_radii = []
+            
             for lab in aug_labels:
                 if lab['vis'] > 0:
                     pts = lab['pts']
@@ -250,13 +252,40 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
                     distances = np.linalg.norm(pts - center, axis=1)
                     base_radius = np.max(distances)
                     radius = int(base_radius * cfg.bg_radius_factor)
+                    all_radii.append(radius)
                     cv2.circle(mask, (int(center[0]), int(center[1])), radius, 1.0, -1)
             
-            if cfg.bg_blur_ksize > 0:
-                mask = cv2.GaussianBlur(mask, (cfg.bg_blur_ksize, cfg.bg_blur_ksize), 0)
-            
-            mask_3d = np.expand_dims(mask, axis=-1)
-            aug_img = (aug_img.astype(np.float32) * mask_3d + bg_img.astype(np.float32) * (1 - mask_3d)).astype(np.uint8)
+            if all_radii:
+                # --- 1. 亮度均衡逻辑 ---
+                gray_aug = cv2.cvtColor(aug_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                roi_pixels = gray_aug[mask > 0.5]
+                
+                if roi_pixels.size > 0:
+                    roi_mean = np.mean(roi_pixels)
+                    gray_bg = cv2.cvtColor(bg_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                    bg_mean = np.mean(gray_bg)
+                    
+                    # 计算增益并限制在合理区间 [0.5, 1.5]
+                    brightness_gain = np.clip(roi_mean / (bg_mean + 1e-6), 0.5, 1.5)
+                    bg_img = np.clip(bg_img.astype(np.float32) * brightness_gain, 0, 255).astype(np.uint8)
+
+                # --- 2. 动态 Ksize 逻辑 ---
+                # 取当前图像中所有目标半径的平均值作为基准
+                avg_radius = np.mean(all_radii)
+                # 计算动态 ksize: 比例 0.2, 并确保是奇数
+                dynamic_ksize = int(avg_radius * 0.2)
+                if dynamic_ksize % 2 == 0:
+                    dynamic_ksize += 1
+                # 限制最小值为 3，防止不模糊
+                dynamic_ksize = max(3, dynamic_ksize)
+
+                # 应用平滑
+                mask = cv2.GaussianBlur(mask, (dynamic_ksize, dynamic_ksize), 0)
+                
+                # --- 3. 最终融合 ---
+                mask_3d = np.expand_dims(mask, axis=-1)
+                aug_img = (aug_img.astype(np.float32) * mask_3d + 
+                           bg_img.astype(np.float32) * (1 - mask_3d)).astype(np.uint8)
 
     # ================= 5. 随机遮挡 (Cutout) =================
     if aug_labels and random.random() < cfg.occ_prob:

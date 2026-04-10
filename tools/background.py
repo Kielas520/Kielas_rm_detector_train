@@ -1,7 +1,13 @@
 import tarfile
 import requests
 import shutil
+import random
+import io
+import yaml  # 需要安装: pip install pyyaml
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+from PIL import Image  # 需要安装: pip install pillow
 from rich.console import Console
 from rich.progress import (
     Progress,
@@ -12,54 +18,114 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.panel import Panel
+from rich.prompt import Confirm  # 用于交互确认
 
 console = Console()
 
-def download_rm_backgrounds(base_path="./background", limit=10000, force_refresh=True):
-    # 1. 路径初始化 (使用 pathlib)
-    root = Path(base_path).resolve()
-    flag_file = root / "extract_finished.flag"
-    tar_file = root / "val_256.tar"
+@dataclass
+class DownloadConfig:
+    """下载与提取任务的全局配置"""
+    url: str = "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
+    limit: int = 5000
+    base_path: str = "./background"
+    tar_file_name: str = "indoorCVPR_09.tar"
+    flag_file_name: str = "done.flag"
+    force_refresh: bool = False
     
-    # 2. 强制刷新逻辑：如果发现 flag，清空文件夹重新开始
-    if force_refresh and flag_file.exists():
-        console.print(Panel("[bold red]检测到旧的完成标记，正在强制刷新文件夹...[/bold red]"))
-        for item in root.iterdir():
-            if item.is_dir():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-        console.print("[green]✔ 文件夹已清空。[/green]")
-    elif not root.exists():
+    max_resolution: int = 1280
+    min_resolution: int = 320
+    
+    proxies: Optional[Dict[str, str]] = field(default_factory=lambda: {
+        "http": "http://127.0.0.1:7897",
+        "https": "http://127.0.0.1:7897",
+    })
+
+def sync_with_yaml(config: DownloadConfig, yaml_path: str = "config.yaml"):
+    """从 YAML 中读取配置并覆盖默认参数"""
+    try:
+        if not Path(yaml_path).exists():
+            return
+            
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+            root_cfg = data.get('kielas_rm_train', {}).get('tools', {})
+            
+            # 1. 读取下载专用配置
+            bg_info = root_cfg.get('background', {})
+            if bg_info:
+                config.url = bg_info.get('url', config.url)
+                config.tar_file_name = bg_info.get('tar_name', config.tar_file_name)
+                config.limit = bg_info.get('limit', config.limit)
+                config.max_resolution = bg_info.get('max_res', config.max_resolution)
+                config.min_resolution = bg_info.get('min_res', config.min_resolution)
+                config.proxies = bg_info.get('proxies', config.proxies)
+
+            # 2. 读取路径配置
+            aug_cfg = root_cfg.get('augment', {})
+            config.base_path = aug_cfg.get('bg_dir', config.base_path)
+            
+            console.print(f"[green]成功从 {yaml_path} 加载配置[/green]")
+    except Exception as e:
+        console.print(f"[yellow]加载 {yaml_path} 失败，使用内置默认值。错误: {e}[/yellow]")
+
+def download_and_extract(config: DownloadConfig):
+    root = Path(config.base_path).resolve()
+    flag_file = root / config.flag_file_name
+    tar_path = root / config.tar_file_name
+    
+    # 检测是否已经处理完成
+    if flag_file.exists() and not config.force_refresh:
+        should_reprocess = Confirm.ask(
+            f"[yellow]检测到数据已在 {config.base_path} 处理完成，是否删除并重新处理？[/yellow]",
+            default=False
+        )
+        if should_reprocess:
+            config.force_refresh = True
+        else:
+            console.print("[green]跳过处理。[/green]")
+            return
+
+    # 执行清理逻辑
+    if config.force_refresh:
+        console.print(Panel(f"[bold red]强制刷新：正在清理目录 {root}[/bold red]"))
+        if root.exists():
+            for item in root.iterdir():
+                try:
+                    if item.is_dir(): shutil.rmtree(item)
+                    else: item.unlink()
+                except Exception as e:
+                    console.print(f"[red]清理失败 {item.name}: {e}[/red]")
+    
+    if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
 
-    # Places365 验证集下载地址
-    url = "http://data.csail.mit.edu/places/places365/val_256.tar"
-    
-    # RM 赛场相关室内关键词 (优先级排序)
-    rm_keywords = ['gymnasium', 'basketball_court', 'badminton_court', 'hangar', 'warehouse', 'garage']
-
-    # 3. 带断点续传的下载逻辑
+    # 下载逻辑
     if not flag_file.exists():
         headers = {}
-        if tar_file.exists():
-            resume_byte = tar_file.stat().st_size
+        resume_byte = tar_path.stat().st_size if tar_path.exists() else 0
+        if resume_byte > 0:
             headers['Range'] = f'bytes={resume_byte}-'
-            mode = 'ab'
-            console.print(f"[yellow]续传模式：已完成 {resume_byte / 1024**2:.2f} MB，继续获取剩余部分...[/yellow]")
-        else:
-            resume_byte = 0
-            mode = 'wb'
+            console.print(f"[yellow]续传模式：从 {resume_byte / 1024**2:.2f} MB 开始...[/yellow]")
 
         try:
-            response = requests.get(url, headers=headers, stream=True, timeout=20)
-            # 如果服务器返回 200 而不是 206，说明不支持续传，重头开始
-            if response.status_code == 200:
-                mode = 'wb'
-                resume_byte = 0
+            response = requests.get(config.url, headers=headers, stream=True, timeout=30, proxies=config.proxies)
             
-            total_size = int(response.headers.get('content-length', 0)) + resume_byte
+            # 如果服务器不支持 Range 或文件已改变，重置下载
+            if response.status_code == 200:
+                resume_byte = 0
+                mode = 'wb'
+            elif response.status_code == 206:
+                mode = 'ab'
+            elif response.status_code == 416: # Range 不符合要求
+                resume_byte = 0
+                mode = 'wb'
+                response = requests.get(config.url, stream=True, timeout=30, proxies=config.proxies)
+            else:
+                console.print(f"[bold red]下载失败，状态码: {response.status_code}[/bold red]")
+                return
 
+            total_size = int(response.headers.get('content-length', 0)) + resume_byte
+            
             with Progress(
                 TextColumn("[bold blue]{task.description}"),
                 BarColumn(),
@@ -69,64 +135,73 @@ def download_rm_backgrounds(base_path="./background", limit=10000, force_refresh
                 TimeRemainingColumn(),
                 console=console
             ) as progress:
-                task_id = progress.add_task("下载 Places365", total=total_size, completed=resume_byte)
-                with tar_file.open(mode) as f:
+                task_id = progress.add_task("下载数据源", total=total_size, completed=resume_byte)
+                with tar_path.open(mode) as f:
                     for chunk in response.iter_content(chunk_size=1024*1024):
-                        f.write(chunk)
-                        progress.update(task_id, advance=len(chunk))
+                        if chunk:
+                            f.write(chunk)
+                            progress.update(task_id, advance=len(chunk))
         except Exception as e:
-            console.print(f"[bold red]下载中断:[/bold red] {e}\n[yellow]提示：再次运行脚本即可从断点处自动续传。[/yellow]")
+            console.print(f"[bold red]网络异常:[/bold red] {e}")
             return
 
-    # 4. 智能筛选与扁平化提取
-    console.print(Panel(f"正在精准筛选 [bold yellow]RM 室内/体育馆风格背景[/bold yellow]\n目标目录: {root}", title="数据提取"))
-    
+    # 提取与过滤逻辑
     try:
-        with tarfile.open(tar_file, 'r') as tar:
-            console.print("[blue]正在扫描压缩包索引，请稍候...[/blue]")
-            # 过滤出所有文件成员
-            all_members = [m for m in tar.getmembers() if m.isfile()]
-            
-            # 筛选逻辑：优先 RM 相关，其次通用室内
-            rm_related = [m for m in all_members if any(kw in m.name.lower() for kw in rm_keywords)]
-            indoor_related = [m for m in all_members if 'indoor' in m.name.lower() and m not in rm_related]
-            
-            selected_members = (rm_related + indoor_related)[:limit]
+        if flag_file.exists():
+            console.print("[green]检测到标记文件，跳过提取。[/green]")
+            return
 
-            # Fallback 机制：如果没有匹配到任何关键词，直接提取前 limit 张
-            if not selected_members:
-                console.print("[bold red]警告：未通过关键词匹配到图片！[/bold red] 执行保底提取策略...")
-                selected_members = all_members[:limit]
-            else:
-                console.print(f"[green]成功匹配：{len(rm_related)} 张核心赛场图，{len(selected_members) - len(rm_related)} 张通用室内图。[/green]")
-
-            # 开始解压写入
+        with tarfile.open(tar_path, 'r:*') as tar:
+            console.print("[blue]执行分辨率过滤采样中...[/blue]")
+            # 过滤出图片文件
+            all_members = [
+                m for m in tar.getmembers() 
+                if m.isfile() and m.name.lower().endswith(('.jpg', '.jpeg', '.png'))
+            ]
+            random.shuffle(all_members)
+            extracted_count = 0
+            
             with Progress(console=console) as progress:
-                task = progress.add_task("[cyan]正在写入图片...", total=len(selected_members))
-                for member in selected_members:
-                    # 强行提取文件名，去掉压缩包内的复杂路径结构
-                    original_filename = Path(member.name).name
-                    if original_filename:
-                        member.name = original_filename
-                        tar.extract(member, path=root)
-                    progress.update(task, advance=1)
+                task = progress.add_task("[cyan]过滤并保存图片...", total=config.limit)
+                for member in all_members:
+                    if extracted_count >= config.limit: 
+                        break
+                    
+                    f_obj = tar.extractfile(member)
+                    if f_obj is None: 
+                        continue
+                        
+                    try:
+                        img_data = f_obj.read()
+                        with Image.open(io.BytesIO(img_data)) as img:
+                            w, h = img.size
+                            # 分辨率过滤
+                            if max(w, h) > config.max_resolution or min(w, h) < config.min_resolution:
+                                continue
+                            
+                            # 保存到根目录，去除原有的压缩包内路径
+                            target_path = root / Path(member.name).name
+                            img.save(target_path)
+                            extracted_count += 1
+                            progress.update(task, advance=1)
+                    except Exception:
+                        continue
             
-        # 5. 收尾工作
-        flag_file.touch() # 创建完成标记
-        if tar_file.exists():
-            tar_file.unlink() # 删除 500MB+ 的压缩包，保持空间整洁
+        flag_file.touch()
+        if tar_path.exists(): 
+            tar_path.unlink()
             
-        console.print(f"[bold green]✔ 任务圆满完成！[/bold green]")
-        console.print(f"最终图片存放于: [white]{root}[/white]")
+        console.print(Panel(f"[bold green]任务完成！[/bold green]\n共计: {extracted_count} 张\n路径: {root}"))
         
     except Exception as e:
-        console.print(f"[bold red]提取过程出错:[/bold red] {e}")
+        console.print(f"[bold red]处理出错:[/bold red] {e}")
 
 if __name__ == "__main__":
-    # 配置信息：请确认此路径是你想要存放图片的路径
-    PROJECT_BG_PATH = "/Users/kielas/project/Kielas_rm_detector_train/background"
+    # 初始化默认配置
+    cfg = DownloadConfig()
     
-    # 运行脚本
-    # limit: 需要的图片张数
-    # force_refresh: 如果设为 True，每次检测到 flag 会删掉旧图重新开始
-    download_rm_backgrounds(base_path=PROJECT_BG_PATH, limit=10000, force_refresh=True)
+    # 自动从 yaml 覆盖配置
+    sync_with_yaml(cfg, "config.yaml")
+    
+    # 执行下载与提取
+    download_and_extract(cfg)

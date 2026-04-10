@@ -1,37 +1,51 @@
 kielas_rm_train:
   dataset:
     balance:
-      max_samples_per_class: 3000
+      max_samples_per_class: 1000
+
     augment:
       # --- 基础与光学增强 ---
       brightness_prob: 0.8
-      brightness_range: [0.6, 3]
+      brightness_range: [0.9, 3.0]
       blur_prob: 0.6              # 运动模糊概率
       blur_ksize: [3, 5, 7]       # 模糊核大小选择
       hsv_prob: 0.5               # HSV色彩空间抖动概率
       hsv_h_gain: 0.015           # 色相变化幅度
       hsv_s_gain: 0.4             # 饱和度变化幅度
-      hsv_v_gain: 0.5             # 明度变化幅度
+      hsv_v_gain: 0.8             # 明度变化幅度
       noise_prob: 0.6             # 高斯噪声概率
       bloom_prob: 0.3             # 光晕/过曝模拟概率
       
       # --- 几何变换增强 ---
-      flip_prob: 0.2              # 水平翻转概率
+      flip_prob: 0.1              # 水平翻转概率
       scale_prob: 0.5             # 缩放概率
       scale_range: [0.8, 1.2]
       rotate_prob: 0.4            # 旋转概率
       rotate_range: [-10, 10]
-      translate_prob: 0.5         # 平移概率
+      translate_prob: 0.3         # 平移概率
       translate_range: 0.1        # 图像宽高比例的平移范围
-      perspective_prob: 0.3       # 透视变换(形变)概率
-      perspective_factor: 0.08    # 透视形变剧烈程度(0-0.2)
+      perspective_prob: 0.4       # 透视变换(形变)概率
+      perspective_factor: 0.10    # 透视形变剧烈程度(0-0.2)
 
       # --- 背景替换增强 (对应代码中 2.x 的修改) ---
-      bg_replace_prob: 1.0        # 背景替换触发概率
+      bg_replace_prob: 0.3        # 背景替换触发概率
       bg_dir: "./background"      # 背景图片存放文件夹
       bg_radius_factor: 1.5       # 约束圆半径倍数 (1.0 为刚好包围目标)
-      bg_blur_ksize: 31           # 边缘羽化程度 (必须为奇数，越大越自然)
       
       # --- 遮挡增强 ---
       occ_prob: 0.5               # 随机遮挡概率
       occ_radius_pct: 0.15        # 遮挡中心偏离目标的半径比例
+
+    split:
+      val: 0.2
+
+  tools:
+    background:
+      url: "http://groups.csail.mit.edu/vision/LabelMe/NewImages/indoorCVPR_09.tar"
+      tar_name: "indoorCVPR_09.tar"
+      limit: 5000
+      max_res: 1280
+      min_res: 320
+      proxies:
+        http: "http://127.0.0.1:7897"
+        https: "http://127.0.0.1:7897"

@@ -23,20 +23,39 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
     log_file_path = output_dir / "sample_log.txt"
 
     all_data = []
-    class_dirs = [d for d in type_dir.iterdir() if d.is_dir()]
     
-    for class_dir in class_dirs:
-        class_id = class_dir.name
-        photo_dir = class_dir / "photos"
-        label_dir = class_dir / "labels"
-        
-        if not photo_dir.exists():
-            continue
+    # === 针对不同数据结构的区分处理 ===
+    if data_type == "datasets":
+        # 结构: datasets/images/[train|val] 和 datasets/labels/[train|val]
+        for split_type in ["train", "val"]:
+            photo_dir = type_dir / "images" / split_type
+            label_dir = type_dir / "labels" / split_type
             
-        for img_path in photo_dir.glob("*.jpg"):
-            label_path = label_dir / img_path.with_suffix('.txt').name
-            all_data.append((img_path, label_path, class_id))
-    
+            if not photo_dir.exists():
+                continue
+                
+            for img_path in photo_dir.glob("*.jpg"):
+                label_path = label_dir / img_path.with_suffix('.txt').name
+                # split.py 中文件名为 {class_id}_{stem}.jpg，提取第一部分作为 class_id
+                class_id = img_path.name.split('_')[0]
+                all_data.append((img_path, label_path, class_id))
+    else:
+        # 原始结构: data_type/class_id/photos 和 data_type/class_id/labels
+        class_dirs = [d for d in type_dir.iterdir() if d.is_dir()]
+        
+        for class_dir in class_dirs:
+            class_id = class_dir.name
+            photo_dir = class_dir / "photos"
+            label_dir = class_dir / "labels"
+            
+            if not photo_dir.exists():
+                continue
+                
+            for img_path in photo_dir.glob("*.jpg"):
+                label_path = label_dir / img_path.with_suffix('.txt').name
+                all_data.append((img_path, label_path, class_id))
+    # ==================================
+
     if not all_data:
         print(f"在 {type_dir} 下未发现任何图片")
         return
@@ -131,13 +150,11 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
                             # 3. 在每个目标左上方绘制 ID 和 状态信息
-                            # 计算目标的左上角位置 (取所有点的最小x和最小y)
                             min_x = min(p[0] for p in pts)
                             min_y = min(p[1] for p in pts)
                             
                             target_label = f"id:{class_id} {info_text}" if info_text else f"id:{class_id}"
                             
-                            # 绘制文字，位置稍微向上偏移 10 像素以防覆盖线段
                             cv2.putText(img, target_label, (min_x, min_y - 10), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2, cv2.LINE_AA)
                         else:
@@ -149,7 +166,13 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                     log_entry += "\n"
 
         log_contents.append(log_entry)
-        out_img_path = output_dir / f"{class_id}_{img_path.name}"
+        
+        # 保存时，如果是 datasets，文件名本身就已经带有前缀了，避免前缀重复
+        if data_type == "datasets":
+            out_img_path = output_dir / img_path.name
+        else:
+            out_img_path = output_dir / f"{class_id}_{img_path.name}"
+            
         cv2.imwrite(str(out_img_path), img)
 
     with log_file_path.open('w', encoding='utf-8') as log_f:
@@ -158,6 +181,5 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
     print(f"成功抽样并处理 {sample_size} 张图片。")
     print(f"结果图片及日志已保存至: {output_dir.absolute()}")
 
-# 调用示例
 if __name__ == "__main__":
-    visualize_dataset("./data", "augment", if_flag=[1, 1])
+    visualize_dataset("./data", "datasets", if_flag=[1, 1])

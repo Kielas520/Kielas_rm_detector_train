@@ -4,7 +4,6 @@ import random
 from pathlib import Path
 from queue import Queue
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
 import yaml
 
 # 引入 rich 组件
@@ -204,9 +203,18 @@ def balance_dataset_pipeline(input_dir: str, output_dir: str, max_samples_per_cl
     console.print(Panel(f"✨ [bold green]处理完毕！[/bold green]\n\n数据已保存至: [underline]{out_path.absolute()}[/underline]\n配置文件: [cyan]train.yaml[/cyan]", border_style="green"))
 
 if __name__ == "__main__":
+    # 打开文件并加载数据
+    max_samples_per_class=3000
+    with open('config.yaml', 'r', encoding='utf-8') as f:
+        # 使用 safe_load 是一种更安全的加载方式，防止执行不安全的代码
+        config = yaml.safe_load(f)
+
+        # 访问参数
+        max_samples_per_class = config['balance']['max_samples_per_class']
+
     balance_dataset_pipeline(
         input_dir="./data/purify", 
         output_dir="./data/balance", 
-        max_samples_per_class=3000, 
+        max_samples_per_class=max_samples_per_class, 
         num_workers=4
     )
