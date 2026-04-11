@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torchvision
 
 class ConvBNReLU(nn.Module):
     """标准的 3x3 卷积块"""
@@ -47,38 +48,45 @@ class RMBackbone(nn.Module):
         x = self.stage1(x)
         x = self.stage2(x)
         feat_stage3 = self.stage3(x)
-        x = self.stage4(feat_stage3)
-        feat_stage5 = self.stage5(x)
-        return feat_stage3, feat_stage5
+        
+        # 提取 Stage4 的特征，此时步长为 16 (输入 640 时输出 40x40)
+        feat_stage4 = self.stage4(feat_stage3)
+        
+        # 提取 Stage5 的特征，此时步长为 32 (输入 640 时输出 20x20)
+        feat_stage5 = self.stage5(feat_stage4)
+        
+        # 返回 stage4 和 stage5
+        return feat_stage4, feat_stage5
     
 class RMNeck(nn.Module):
-    """特征融合层 (FPN 变体)"""
-    def __init__(self, in_channels_s3=64, in_channels_s5=256, out_channels=256):
+    """特征融合层 (标准的自顶向下 FPN 变体)"""
+    def __init__(self, in_channels_s4=128, in_channels_s5=256, out_channels=256):
         super().__init__()
-        self.downsample_s3 = nn.Sequential(
-            nn.Conv2d(in_channels_s3, in_channels_s3, kernel_size=4, stride=4, 
-                      groups=in_channels_s3, bias=False),
-            nn.BatchNorm2d(in_channels_s3),
+        
+        # 将深层特征 (s5) 上采样 2 倍，从 20x20 放大到 40x40，并降维到 128 通道
+        self.upsample_s5 = nn.Sequential(
+            nn.Conv2d(in_channels_s5, 128, kernel_size=1, bias=False),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels_s3, 64, kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
+            nn.Upsample(scale_factor=2, mode='nearest')
         )
         
+        # 将 s4 (128通道) 和 放大后的 s5 (128通道) 拼接后融合，输出目标通道数
         self.fuse = nn.Sequential(
-            ConvBNReLU(64 + in_channels_s5, out_channels),
+            ConvBNReLU(in_channels_s4 + 128, out_channels),
             DepthwiseConvBlock(out_channels, out_channels)
         )
 
-    def forward(self, feat_s3, feat_s5):
-        feat_s3_down = self.downsample_s3(feat_s3)
-        out = torch.cat([feat_s3_down, feat_s5], dim=1) 
+    def forward(self, feat_s4, feat_s5):
+        feat_s5_up = self.upsample_s5(feat_s5)
+        # 此时两个特征图都是 40x40 分辨率，可以直接拼接
+        out = torch.cat([feat_s4, feat_s5_up], dim=1) 
         out = self.fuse(out) 
         return out
 
-
+# RMHead 保持不变
 class RMHead(nn.Module):
-    """解耦检测头 (Decoupled Head)"""
+    # ... [保持你原来的代码] ...
     def __init__(self, in_channels=256):
         super().__init__()
         self.box_head = nn.Conv2d(in_channels, 5, kernel_size=1, stride=1)
@@ -90,35 +98,31 @@ class RMHead(nn.Module):
         out = torch.cat([box_out, pose_out], dim=1)
         return out
 
-
 class RMDetector(nn.Module):
     """完整的单阶段装甲板检测模型"""
     def __init__(self):
         super().__init__()
         self.backbone = RMBackbone()
-        self.neck = RMNeck(in_channels_s3=64, in_channels_s5=256, out_channels=256)
+        # 注意这里传入的通道数匹配 Stage4 和 Stage5
+        self.neck = RMNeck(in_channels_s4=128, in_channels_s5=256, out_channels=256)
         self.head = RMHead(in_channels=256)
 
     def forward(self, x):
-        feat_s3, feat_s5 = self.backbone(x)
-        fused_feat = self.neck(feat_s3, feat_s5)
+        feat_s4, feat_s5 = self.backbone(x)
+        fused_feat = self.neck(feat_s4, feat_s5)
         out = self.head(fused_feat)
         return out
 
-
-# ==========================================
 # 新增：核心解码工具函数 (供推断与可视化使用)
-# ==========================================
-def decode_tensor(tensor, is_pred=True, conf_threshold=0.5, grid_size=(13, 13), img_size=(416, 416)):
+
+def decode_tensor(tensor, is_pred=True, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(13, 13), img_size=(416, 416)):
     """
-    将 13 维的网格张量解码为真实的物理像素坐标
-    可以同时处理真实标签 (GT) 和网络预测 (Pred)
+    将 13 维的网格张量解码为真实的物理像素坐标，并增加 NMS 后处理
     """
     batch_size = tensor.shape[0]
     grid_w, grid_h = grid_size
     img_w, img_h = img_size
     
-    # 如果是预测结果，置信度通道需要经过 Sigmoid 激活；真实标签则不需要
     if is_pred:
         conf = torch.sigmoid(tensor[:, 0, :, :])
     else:
@@ -127,57 +131,65 @@ def decode_tensor(tensor, is_pred=True, conf_threshold=0.5, grid_size=(13, 13), 
     batch_results = []
     
     for b in range(batch_size):
-        # 1. 过滤低于置信度阈值的网格
         mask = conf[b] >= conf_threshold
         if not mask.any():
             batch_results.append([])
             continue
             
-        # 2. 拿到有目标的网格索引
         grid_y, grid_x = torch.nonzero(mask, as_tuple=True)
         scores = conf[b, grid_y, grid_x]
         
-        # 3. 提取位姿数据 (8个偏移量)
-        # 【修复点】：PyTorch 高级索引取出的形状是 [8, N]，需要转置为 [N, 8]
         raw_pose = tensor[b, 5:13, grid_y, grid_x].T  
         decoded_pose = torch.zeros_like(raw_pose)
         
-        # 4. 反向解码 4 点坐标
         for i in range(4): 
             px_offset = raw_pose[:, i*2]
             py_offset = raw_pose[:, i*2 + 1]
             
-            # 计算全图归一化坐标 [0, 1]
             px_norm = (px_offset + grid_x) / grid_w
             py_norm = (py_offset + grid_y) / grid_h
             
-            # 转换为实际像素坐标
             decoded_pose[:, i*2] = px_norm * img_w
             decoded_pose[:, i*2 + 1] = py_norm * img_h
             
-        # 拼合结果: [score, x1, y1, x2, y2, x3, y3, x4, y4]
+        # ==========================================
+        # 新增：非极大值抑制 (NMS) 逻辑
+        # ==========================================
+        if is_pred:
+            # 1. 计算 4 个关键点的最小外接矩形，用于计算 IoU
+            # 将 [N, 8] 重塑为 [N, 4, 2] 以便计算 min 和 max
+            pts = decoded_pose.view(-1, 4, 2)
+            min_xy, _ = torch.min(pts, dim=1) # 获取左上角坐标 (x1, y1)
+            max_xy, _ = torch.max(pts, dim=1) # 获取右下角坐标 (x2, y2)
+            
+            # 拼接为标准的边界框格式 [N, 4] -> (x1, y1, x2, y2)
+            boxes_for_nms = torch.cat([min_xy, max_xy], dim=1)
+            
+            # 2. 执行 NMS，返回保留下来的索引
+            keep_idx = torchvision.ops.nms(boxes_for_nms, scores, nms_iou_threshold)
+            
+            # 3. 根据索引过滤结果
+            scores = scores[keep_idx]
+            decoded_pose = decoded_pose[keep_idx]
+        
+        # 拼合结果
         dets = torch.cat([scores.unsqueeze(1), decoded_pose], dim=1)
         batch_results.append(dets.detach().cpu().numpy())
         
     return batch_results
 
-# 测试完整模型
 if __name__ == "__main__":
     model = RMBackbone()
-    dummy_input = torch.randn(1, 3, 320, 320)
-    out3, out5 = model(dummy_input)
-    print(f"Stage 3 Output Shape: {out3.shape}") # 预期: [1, 64, 40, 40]
-    print(f"Stage 5 Output Shape: {out5.shape}") # 预期: [1, 256, 10, 10]
-    # 实例化模型
-    model = RMDetector()
+    dummy_input = torch.randn(1, 3, 640, 640)
+    out4, out5 = model(dummy_input)
+    print(f"Stage 4 Output Shape: {out4.shape}") # 预期: [1, 128, 40, 40]
+    print(f"Stage 5 Output Shape: {out5.shape}") # 预期: [1, 256, 20, 20]
     
-    # 模拟输入：Batch Size 为 2，3 通道，320x320
-    dummy_input = torch.randn(2, 3, 320, 320)
-    
-    # 前向传播
-    output = model(dummy_input)
+    # 实例化完整模型
+    detector = RMDetector()
+    output = detector(dummy_input)
     
     print(f"输入形状: {dummy_input.shape}")
     print(f"输出形状: {output.shape}") 
-    # 预期输出形状: torch.Size([2, 13, 10, 10])，与 dataset 中生成的 target_tensor 完全对应
+    # 预期输出形状: torch.Size([1, 13, 40, 40])
     

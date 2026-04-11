@@ -31,9 +31,9 @@ class RMDetLoss(nn.Module):
         
         # 【修正部分】: 放弃使用单一 Sigmoid 压榨宽高，
         # 借用 YOLOv5 的缩放策略，使得网络更容易输出归一化后的相对尺度。
-        w = (torch.sigmoid(boxes[:, 2]) * 2) ** 2
-        h = (torch.sigmoid(boxes[:, 3]) * 2) ** 2
-        
+        w = torch.clamp(torch.sigmoid(boxes[:, 2]), min=1e-6) # 限幅
+        h = torch.clamp(torch.sigmoid(boxes[:, 3]), min=1e-6) # 1
+         
         cx = (tx + grid_x) / self.grid_w
         cy = (ty + grid_y) / self.grid_h
         

@@ -2,13 +2,13 @@ kielas_rm_train:
   # --- 训练超参数 ---
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
-    batch_size: 4
-    epochs: 100
-    learning_rate: 0.0005
-    weight_decay: 0.0001
+    batch_size: 32
+    epochs: 50
+    learning_rate: 0.001
+    weight_decay: 0.0005
     save_dir: "./model_res"
-    input_size: [640, 640]      # 已修正: 9 * 32 = 288
-    grid_size: [20, 20]
+    input_size: [640, 640]
+    grid_size: [40, 40]
 
     data:
       # --- 数据集路径与加载配置 ---
@@ -16,13 +16,17 @@ kielas_rm_train:
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 4
+      num_workers: 8
 
     # --- 损失函数权重 ---
     loss:
       lambda_conf: 1.0
-      lambda_box: 2.0
-      lambda_pose: 1.0
+      lambda_box: 1.5
+      lambda_pose: 3.0
+    # --- 新增：提前停止机制 ---
+    early_stopping:
+      enabled: true        # 是否开启自动停止
+      min_val_loss: 0.15   # 验证集 loss 低于此值时触发停止
 
   dataset:
     balance:
