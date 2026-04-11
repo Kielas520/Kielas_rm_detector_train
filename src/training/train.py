@@ -14,10 +14,10 @@ from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, T
 import matplotlib
 matplotlib.use('Agg')  # 必须在 import pyplot 之前调用
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import numpy as np
 from pathlib import Path
 import shutil
+import gc
 
 # 导入模块
 from src.datasets import RMArmorDataset
@@ -297,18 +297,39 @@ def main():
             f.write("Epoch\tLR\tTrain_Loss\tVal_Loss\n")
             for i in range(len(history['train'])):
                 f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train'][i]:.6f}\t{history['val'][i]:.6f}\n")
-        
+        # 1. 显式删除带有 persistent_workers 的 DataLoader 并强制垃圾回收，等待后台进程安全退出
+        del train_loader
+        del val_loader
+        gc.collect()
+
         console.print("\n[bold cyan]正在生成识别效果可视化图片...[/bold cyan]")
         model.load_state_dict(torch.load(save_dir / "best_model.pth"))
-        # 创建单线程的临时 Loader 避开 Tcl/Tk 线程冲突
+        
+        # 2. 重新实例化 Dataset，彻底阻断与之前多进程上下文的联系
+        vis_train_dataset = RMArmorDataset(
+            data_cfg['train_img_dir'], 
+            data_cfg['train_label_dir'],
+            input_size=input_size, 
+            grid_size=grid_size,
+            cache_device=cache_dev
+        )
+        
+        vis_val_dataset = RMArmorDataset(
+            data_cfg['val_img_dir'], 
+            data_cfg['val_label_dir'],
+            input_size=input_size, 
+            grid_size=grid_size,
+            cache_device=cache_dev
+        )
+
         vis_train_loader = DataLoader(
-            train_loader.dataset, 
+            vis_train_dataset, 
             batch_size=1, 
             shuffle=True, 
             num_workers=0
         )
         vis_val_loader = DataLoader(
-            val_loader.dataset, 
+            vis_val_dataset, 
             batch_size=1, 
             shuffle=True, 
             num_workers=0
