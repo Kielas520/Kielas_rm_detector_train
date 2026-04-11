@@ -11,6 +11,8 @@ cv2.ocl.setUseOpenCL(False)
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+import matplotlib
+matplotlib.use('Agg')  # 必须在 import pyplot 之前调用
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
@@ -298,9 +300,22 @@ def main():
         
         console.print("\n[bold cyan]正在生成识别效果可视化图片...[/bold cyan]")
         model.load_state_dict(torch.load(save_dir / "best_model.pth"))
+        # 创建单线程的临时 Loader 避开 Tcl/Tk 线程冲突
+        vis_train_loader = DataLoader(
+            train_loader.dataset, 
+            batch_size=1, 
+            shuffle=True, 
+            num_workers=0
+        )
+        vis_val_loader = DataLoader(
+            val_loader.dataset, 
+            batch_size=1, 
+            shuffle=True, 
+            num_workers=0
+        )
         
-        visualize_predictions(model, train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5)
-        visualize_predictions(model, val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5)
+        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5)
+        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5)
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 
