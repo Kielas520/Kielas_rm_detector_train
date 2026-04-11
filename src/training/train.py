@@ -1,6 +1,7 @@
 import yaml
 import torch
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 import cv2
@@ -78,7 +79,7 @@ def validate(model, dataloader, criterion, device, epoch, progress):
     return total_loss / len(dataloader)
 
 @torch.no_grad()
-def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, grid_size, num_samples=5):
+def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, grid_size, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
     model.eval()
     count = 0
     task_id = progress.add_task(f"[yellow]导出 {prefix} 图像...", total=num_samples)
@@ -89,7 +90,8 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
         preds = model(imgs) 
         
         gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
-        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=0.5, grid_size=grid_size, img_size=input_size)
+        # 在解码预测框时使用传入的配置
+        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_threshold, nms_iou_threshold=nms_iou_threshold, grid_size=grid_size, img_size=input_size)
         
         for i in range(imgs.size(0)):
             if count >= num_samples:
@@ -160,7 +162,12 @@ def main():
     train_cfg = cfg['train']
     loss_cfg = cfg['train']['loss']
     data_cfg = cfg['train']['data']
+    post_cfg = cfg['train']['post_process']
     
+    # 获取阈值，如果 yaml 里没写则提供默认值
+    conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
+    nms_thresh = float(post_cfg.get('nms_iou_threshold', 0.45))
+
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
     min_val_loss_threshold = float(early_stop_cfg.get('min_val_loss', 0.15))
@@ -191,7 +198,6 @@ def main():
     # ==========================================
     cache_dev = None 
     
-    # 之前这里被我写死了 workers = 4，现在改回读取你的配置
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False
     
@@ -237,20 +243,29 @@ def main():
         grid_size=grid_size
     ).to(device)
     
+    # ==========================================
+    # 提取学习率相关配置
+    # ==========================================
+    lr_cfg = train_cfg['learning_rate']
+    base_lr = float(lr_cfg['base_lr'])
+    lr_patience = int(lr_cfg.get('patience', 3))
+    lr_factor = float(lr_cfg.get('factor', 0.5))
+
     optimizer = optim.AdamW(
         model.parameters(), 
-        lr=float(train_cfg['learning_rate']), 
+        lr=base_lr, 
         weight_decay=float(train_cfg['weight_decay'])
     )
-    
+
     warmup_epochs = max(1, int(epochs * 0.05))
-    scheduler_warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
-    scheduler_cosine = CosineAnnealingLR(optimizer, T_max=(epochs - warmup_epochs), eta_min=1e-6)
-    
-    scheduler = SequentialLR(
-        optimizer, 
-        schedulers=[scheduler_warmup, scheduler_cosine], 
-        milestones=[warmup_epochs]
+
+    # 定义基于 Loss 的调度器 (读取 config 中的参数)
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',          # 监控的指标期望是越小越好 (Loss)
+        factor=lr_factor,    # 触发时，学习率乘以的系数
+        patience=lr_patience,# 容忍多少个 epoch Loss 不下降才触发衰减
+        min_lr=1e-6          # 设定的最小学习率底线
     )
 
     best_val_loss = float('inf')
@@ -267,12 +282,22 @@ def main():
         epoch_task = progress.add_task("[bold green]总体训练进度", total=epochs)
         
         for epoch in range(1, epochs + 1):
+            # --- 1. 执行训练和验证 ---
             train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress)
             val_loss = validate(model, val_loader, criterion, device, epoch, progress)
             
-            current_lr = optimizer.param_groups[0]['lr']
-            scheduler.step()
+            # --- 2. 学习率调度逻辑 ---
+            if epoch <= warmup_epochs:
+                # 处于 Warmup 阶段：线性增加学习率
+                current_lr = base_lr * (epoch / warmup_epochs)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+            else:
+                # Warmup 结束后：根据验证集 Loss 动态调整
+                scheduler.step(val_loss)
+                current_lr = optimizer.param_groups[0]['lr']
 
+            # --- 3. 记录与打印 ---
             history['train'].append(train_loss)
             history['val'].append(val_loss)
             history['lr'].append(current_lr)
@@ -335,8 +360,8 @@ def main():
             num_workers=0
         )
         
-        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5)
-        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5)
+        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
+        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 

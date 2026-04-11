@@ -1,14 +1,23 @@
 kielas_rm_train:
   # --- 训练超参数 ---
   train:
-    device: "cuda"              # 可选: "auto", "cuda", "cpu"
+    device: "cpu"              # 可选: "auto", "cuda", "cpu"
     batch_size: 32
     epochs: 50
-    learning_rate: 0.001
     weight_decay: 0.0005
     save_dir: "./model_res"
-    input_size: [640, 640]
-    grid_size: [40, 40]
+    input_size: [416, 416]
+    grid_size: [52, 52]
+
+    learning_rate:
+      base_lr: 0.001
+      patience: 3
+      factor: 0.5
+
+    # 新增后处理配置块
+    post_process:
+      conf_threshold: 0.9
+      nms_iou_threshold: 0.5
 
     data:
       # --- 数据集路径与加载配置 ---
@@ -30,7 +39,7 @@ kielas_rm_train:
 
   dataset:
     balance:
-      max_samples_per_class: 1000
+      max_samples_per_class: 3000
 
     augment:
       # --- 基础与光学增强 ---

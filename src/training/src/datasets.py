@@ -12,10 +12,10 @@ cv2.ocl.setUseOpenCL(False)
 # ---------------------------------------------------------
 # 1. 目标编码逻辑 
 # ---------------------------------------------------------
-def encode_target(label_data, img_w=320, img_h=320, grid_w=10, grid_h=10):
+
+def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52):
     """
-    将原始标签转化为 13维的特征图网格张量
-    label_data: [class_id, visibility, x1, y1, x2, y2, x3, y3, x4, y4]
+    返回一个列表，包含中心网格及其相邻网格的训练目标 (Center Sampling)
     """
     kpts = np.array(label_data[2:]).reshape(4, 2)
     
@@ -29,23 +29,50 @@ def encode_target(label_data, img_w=320, img_h=320, grid_w=10, grid_h=10):
     w_norm, h_norm = w / img_w, h / img_h
     kpts_norm = kpts / np.array([img_w, img_h])
     
-    g_x = int(np.clip(cx_norm * grid_w, 0, grid_w - 1))
-    g_y = int(np.clip(cy_norm * grid_h, 0, grid_h - 1))
+    # 获取浮点网格坐标
+    grid_x_float = cx_norm * grid_w
+    grid_y_float = cy_norm * grid_h
     
-    t_x = cx_norm * grid_w - g_x
-    t_y = cy_norm * grid_h - g_y
+    g_x = int(np.clip(grid_x_float, 0, grid_w - 1))
+    g_y = int(np.clip(grid_y_float, 0, grid_h - 1))
     
-    kpts_grid_offset = kpts_norm * np.array([grid_w, grid_h]) - np.array([g_x, g_y])
-    kpts_offset_flat = kpts_grid_offset.flatten()
+    # 候选网格列表：至少包含中心网格
+    candidates = [(g_x, g_y)]
     
-    target_vector = np.zeros(13, dtype=np.float32)
-    target_vector[0] = 1.0 
-    target_vector[1:5] = [t_x, t_y, w_norm, h_norm]
-    target_vector[5:13] = kpts_offset_flat
-    
+    # X方向扩散：如果偏移小于 0.5，说明偏左，拉上左边的网格；反之拉上右边
+    offset_x = grid_x_float - g_x
+    if offset_x < 0.5 and g_x > 0:
+        candidates.append((g_x - 1, g_y))
+    elif offset_x > 0.5 and g_x < grid_w - 1:
+        candidates.append((g_x + 1, g_y))
+        
+    # Y方向扩散：如果偏移小于 0.5，说明偏上，拉上上面的网格；反之拉上下面
+    offset_y = grid_y_float - g_y
+    if offset_y < 0.5 and g_y > 0:
+        candidates.append((g_x, g_y - 1))
+    elif offset_y > 0.5 and g_y < grid_h - 1:
+        candidates.append((g_x, g_y + 1))
+        
+    results = []
     class_id = int(label_data[0])
     
-    return target_vector, g_x, g_y, class_id
+    # 为每一个候选网格重新计算相对偏移量
+    for (cg_x, cg_y) in candidates:
+        t_x = grid_x_float - cg_x
+        t_y = grid_y_float - cg_y
+        
+        # 关键点基于当前分配网格的偏移
+        kpts_grid_offset = kpts_norm * np.array([grid_w, grid_h]) - np.array([cg_x, cg_y])
+        kpts_offset_flat = kpts_grid_offset.flatten()
+        
+        target_vector = np.zeros(13, dtype=np.float32)
+        target_vector[0] = 1.0  # 正样本置信度
+        target_vector[1:5] = [t_x, t_y, w_norm, h_norm]
+        target_vector[5:13] = kpts_offset_flat
+        
+        results.append((target_vector, cg_x, cg_y, class_id))
+        
+    return results
 
 class RMArmorDataset(Dataset):
     def __init__(self, img_dir, label_dir, input_size=(320, 320), grid_size=(10, 10), transform=None, cache_device=None):
@@ -112,14 +139,17 @@ class RMArmorDataset(Dataset):
                 else:          
                     label_data[i] *= scale_y
 
-            target_vec, g_x, g_y, class_id = encode_target(
+            # 原本的单网格分配被移除
+            # 替换为新的多网格分配逻辑
+            targets_info = encode_multi_targets(
                 label_data, 
                 img_w=self.input_size[0], img_h=self.input_size[1], 
                 grid_w=self.grid_size[0], grid_h=self.grid_size[1]
             )
             
-            target_tensor[:, g_y, g_x] = target_vec
-            class_tensor[0, g_y, g_x] = class_id
+            for target_vec, cg_x, cg_y, class_id in targets_info:
+                target_tensor[:, cg_y, cg_x] = target_vec
+                class_tensor[0, cg_y, cg_x] = class_id
 
         # 5. 转为 Tensor 并归一化
         img_tensor = torch.from_numpy(img_resized.transpose(2, 0, 1)).float() / 255.0

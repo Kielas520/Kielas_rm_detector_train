@@ -1,49 +1,55 @@
 [project]
 name = "kielas-rm-detector-train"
 version = "0.1.0"
-description = "适合 rm 视觉体质的关键点检测模型"
+description = "跨平台 rm 视觉关键点检测环境"
 readme = "README.md"
-authors = [
-    { name = "Kielas", email = "c1470759@outlook.com" }
-]
-
-# 将 "==3.10" 修改为 ">=3.10"，以提供更好的环境兼容性。
-# 如果你必须严格锁定 3.10 版本，可以改回 "==3.10"。
 requires-python = ">=3.10"
+authors = [{ name = "Kielas", email = "c1470759@outlook.com" }]
 
+# 基础通用依赖（不含 torch，由下方 groups 注入）
 dependencies = [
     "cvbridge3>=1.1",
-    "matplotlib>=3.10.*",
     "numpy>=1.24.0,<2.0.0",
-    "opencv-python<4.11",  # 限制版本以兼容 NumPy 1.x
+    "opencv-python<4.11",
     "rich>=14.3.3",
     "PyYAML",
     "requests>=2.33.1",
-    "torch>=2.4.0",
-    "torchvision>=0.19.0",
+    "matplotlib>=3.10.*",
     "ipywidgets>=8.0.0",
 ]
 
-[project.optional-dependencies]
-deploy = [
-    "onnx>=1.16.0",
-    "onnxscript>=0.1.0",
-    "onnxsim>=0.4.33",
-    "torchsummary>=1.5.1",
-    "onnxruntime-gpu>=1.18.0", # 替换为 GPU 版本
+[dependency-groups]
+# Windows 组：锁定支持 50 系显卡的 cu128
+win = [
+    "torch>=2.4.0; sys_platform == 'win32'",
+    "torchvision>=0.19.0; sys_platform == 'win32'",
+    "onnxruntime-gpu>=1.18.0; sys_platform == 'win32'",
 ]
-
-[tool.hatch.build.targets.wheel]
-packages = ["."]
+# macOS 组：使用官方原生索引（支持 Metal/MPS 加速）
+mac = [
+    "torch>=2.4.0; sys_platform == 'darwin'",
+    "torchvision>=0.19.0; sys_platform == 'darwin'",
+]
+# Linux 组：通常使用通用 CUDA 12.x 或 CPU 版本
+linux = [
+    "torch>=2.4.0; sys_platform == 'linux'",
+    "torchvision>=0.19.0; sys_platform == 'linux'",
+]
 
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-# 替换为支持 50 系显卡的源，可能需要使用 preview (test) 频道
+index-strategy = "unsafe-best-match"
+# 额外索引：主要服务于 Windows 的预览版驱动
 extra-index-url = ["https://download.pytorch.org/whl/test/cu128"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+# 核心逻辑：只有在 Windows 平台时，torch 才去寻找 cu128 索引
+torch = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'win32'" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
