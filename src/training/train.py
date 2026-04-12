@@ -128,7 +128,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, grid_size=grid_size, img_size=input_size)
         pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=grid_size, img_size=input_size)
         
-        # 计算 PCK@5
+        # 计算 PCK@0.5
         correct, total = calculate_pck(gt_dets, pred_dets, pck_cfg)
         total_correct += correct
         total_kpts += total
@@ -395,7 +395,7 @@ def main():
             history['val'].append(val_pck) # history 这里为了方便直接存 pck
             history['lr'].append(current_lr)
             
-            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val PCK@5: {val_pck:.4f}")
+            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val PCK@0.5: {val_pck:.4f}")
             
             # 核心修改：以 PCK 最高作为保存最佳权重的依据
             if val_pck > best_val_pck:
