@@ -168,10 +168,11 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
         for lab in aug_labels:
             lab['pts'][:, 0] = w - lab['pts'][:, 0]
             old_pts = lab['pts'].copy()
-            lab['pts'][0] = old_pts[3]  
-            lab['pts'][1] = old_pts[2]  
-            lab['pts'][2] = old_pts[1]  
-            lab['pts'][3] = old_pts[0]  
+            # 正确的映射：左边变右边，右边变左边，上下保持不变
+            lab['pts'][0] = old_pts[2]  # 新左下 = 旧右下
+            lab['pts'][1] = old_pts[3]  # 新左上 = 旧右上
+            lab['pts'][2] = old_pts[0]  # 新右下 = 旧左下
+            lab['pts'][3] = old_pts[1]  # 新右上 = 旧左上  
 
     if random.random() < cfg.scale_prob:
         scale = random.uniform(*cfg.scale_range)

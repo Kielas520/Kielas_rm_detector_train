@@ -141,11 +141,13 @@ class RMArmorDataset(Dataset):
 
             # 提取类别 ID
             class_id = int(label_data[0])
-
+            vis = int(label_data[1])
             # --- 新增核心逻辑：直接拦截不需要的类别 ---
-            if class_id not in keep_classes:
-                continue  # 直接跳过，不编码为目标张量，当作背景处理
-                
+            # # 直接跳过，不编码为目标张量，当作背景处理
+                # 核心拦截逻辑：不可见目标直接当作背景忽略
+            if class_id not in keep_classes or vis == 0:
+                continue
+            
             for i in range(2, len(label_data)):
                 if i % 2 == 0: 
                     label_data[i] *= scale_x

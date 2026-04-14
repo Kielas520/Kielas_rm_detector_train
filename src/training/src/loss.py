@@ -26,7 +26,7 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.0, lambda_cls = 1.0, alpha=0.85, gamma=2.0, grid_size=(10, 10)):
+    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.5, lambda_cls = 1.0, alpha=0.85, gamma=2.0, grid_size=(10, 10)):
         """
         联合损失函数模块
         lambda_conf, lambda_box, lambda_pose 分别为各项损失的权重系数
@@ -35,7 +35,7 @@ class RMDetLoss(nn.Module):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_box = lambda_box
-        self.lambda_pose = lambda_pose
+        self.lambda_pose = lambda_pose 
         self.lambda_cls = lambda_cls
         self.grid_w, self.grid_h = grid_size
         
@@ -125,12 +125,27 @@ class RMDetLoss(nn.Module):
         loss_box = complete_box_iou_loss(pred_boxes, target_boxes, reduction='mean')
 
         # -----------------------------------------
-        # 4. 关键点损失 (Smooth L1 Loss)
+        # 4. 关键点损失 (Smooth L1 Loss + OKS)
         # -----------------------------------------
-        pred_pose = pred[:, 5:13, :, :].permute(0, 2, 3, 1)[pos_mask]
+        pred_pose_raw = pred[:, 5:13, :, :].permute(0, 2, 3, 1)[pos_mask]
         target_pose = target[:, 5:13, :, :].permute(0, 2, 3, 1)[pos_mask]
         
-        loss_pose = self.smooth_l1(pred_pose, target_pose)
+        # 引入激活约束：约束物理偏移不超过 [-3, 3] 个网格
+        pred_pose = torch.sigmoid(pred_pose_raw) * 6.0 - 3.0
+        
+        loss_pose_l1 = self.smooth_l1(pred_pose, target_pose)
+        
+        # OKS 几何结构约束
+        w_norm = target[:, 3, :, :][pos_mask]
+        h_norm = target[:, 4, :, :][pos_mask]
+        scale = (w_norm * self.grid_w) * (h_norm * self.grid_h) + 1e-6
+        
+        dists_sq = ((pred_pose - target_pose) ** 2).view(-1, 4, 2).sum(dim=-1)
+        oks = torch.exp(-dists_sq / (2 * scale.unsqueeze(1) * 0.05))
+        loss_oks = 1.0 - oks.mean()
+        
+        # 混合 Pose Loss
+        loss_pose = loss_pose_l1 + loss_oks * 0.5
 
         # -----------------------------------------
         # 5. 分类损失 (CrossEntropy Loss)

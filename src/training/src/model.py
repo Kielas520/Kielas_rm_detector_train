@@ -3,11 +3,11 @@ import torch.nn as nn
 import torchvision
 
 class ConvBNReLU(nn.Module):
-    """标准的 3x3 卷积块"""
-    def __init__(self, in_channels, out_channels, stride=1):
+    """标准的卷积块，支持调整 kernel_size 和 padding"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
-                              stride=stride, padding=1, bias=False)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, 
+                              stride=stride, padding=padding, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
@@ -16,9 +16,12 @@ class ConvBNReLU(nn.Module):
 
 
 class DepthwiseConvBlock(nn.Module):
-    """深度可分离卷积块 (Depthwise Separable Convolution)"""
-    def __init__(self, in_channels, out_channels, stride=1):
+    """深度可分离卷积块 (Depthwise Separable Convolution) - 已增加残差连接支持"""
+    def __init__(self, in_channels, out_channels, stride=1, use_res=False):
         super().__init__()
+        # 只有在步长为1且输入输出通道相同时，才开启残差连接
+        self.use_res = use_res and (stride == 1) and (in_channels == out_channels)
+        
         self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, 
                                    stride=stride, padding=1, groups=in_channels, bias=False)
         self.bn1 = nn.BatchNorm2d(in_channels)
@@ -30,9 +33,45 @@ class DepthwiseConvBlock(nn.Module):
         self.relu2 = nn.ReLU(inplace=True)
 
     def forward(self, x):
-        x = self.relu1(self.bn1(self.depthwise(x)))
-        x = self.relu2(self.bn2(self.pointwise(x)))
-        return x
+        out = self.relu1(self.bn1(self.depthwise(x)))
+        out = self.relu2(self.bn2(self.pointwise(out)))
+        if self.use_res:
+            return x + out
+        return out
+
+
+class StackedBlocks(nn.Module):
+    """连续堆叠多个 Block，增加网络深度和特征提取容量"""
+    def __init__(self, in_channels, out_channels, num_blocks, stride=1):
+        super().__init__()
+        layers = []
+        # 第一层负责跨通道和下采样
+        layers.append(DepthwiseConvBlock(in_channels, out_channels, stride=stride, use_res=False))
+        # 后续层保持通道数和分辨率，并开启残差连接
+        for _ in range(num_blocks - 1):
+            layers.append(DepthwiseConvBlock(out_channels, out_channels, stride=1, use_res=True))
+        self.blocks = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.blocks(x)
+
+
+class SPPF(nn.Module):
+    """空间金字塔池化 (快速版)，显著增加感受野"""
+    def __init__(self, in_channels, out_channels, k=5):
+        super().__init__()
+        c_ = in_channels // 2  
+        self.cv1 = ConvBNReLU(in_channels, c_, kernel_size=1, padding=0)
+        self.cv2 = ConvBNReLU(c_ * 4, out_channels, kernel_size=1, padding=0)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        y1 = self.m(x)
+        y2 = self.m(y1)
+        y3 = self.m(y2)
+        return self.cv2(torch.cat([x, y1, y2, y3], 1))
+
 
 # RMHead 保持不变
 class RMHead(nn.Module):
@@ -53,82 +92,80 @@ class RMHead(nn.Module):
         out = torch.cat([box_out, pose_out, cls_out], dim=1)
         return out
 
+
 class RMBackbone(nn.Module):
     def __init__(self):
         super().__init__()
         self.stage1 = ConvBNReLU(3, 16, stride=2)
-        self.stage2 = DepthwiseConvBlock(16, 32, stride=2)
-        self.stage3 = DepthwiseConvBlock(32, 64, stride=2)
-        self.stage4 = DepthwiseConvBlock(64, 128, stride=2)
-        self.stage5 = DepthwiseConvBlock(128, 256, stride=2)
+        # 增加 Block 堆叠深度
+        self.stage2 = StackedBlocks(16, 32, num_blocks=2, stride=2)   # Stride 4
+        self.stage3 = StackedBlocks(32, 64, num_blocks=3, stride=2)   # Stage 3: 步长 8 (416 -> 52x52, 64通道)
+        self.stage4 = StackedBlocks(64, 128, num_blocks=3, stride=2)  # Stage 4: 步长 16 (416 -> 26x26, 128通道)
+        self.stage5 = StackedBlocks(128, 256, num_blocks=3, stride=2) # Stage 5: 步长 32 (416 -> 13x13, 256通道)
+        
+        self.sppf = SPPF(256, 256, k=5)
 
     def forward(self, x):
         x = self.stage1(x)
-        x = self.stage2(x)
-        # Stage 3: 步长 8 (416 -> 52x52, 64通道)
-        feat_stage3 = self.stage3(x)
-        # Stage 4: 步长 16 (416 -> 26x26, 128通道)
-        feat_stage4 = self.stage4(feat_stage3)
-        # Stage 5: 步长 32 (416 -> 13x13, 256通道)
-        feat_stage5 = self.stage5(feat_stage4)
+        feat_s2 = self.stage2(x)
+        feat_s3 = self.stage3(feat_s2)
+        feat_s4 = self.stage4(feat_s3)
+        feat_s5 = self.stage5(feat_s4)
+        feat_s5 = self.sppf(feat_s5)
         
-        return feat_stage3, feat_stage4, feat_stage5
+        # 抛出 S2 参与底层几何特征的融合
+        return feat_s2, feat_s3, feat_s4, feat_s5
     
+
 class RMNeck(nn.Module):
-    """逐级融合特征金字塔 (5融4, 4融3)"""
-    def __init__(self, in_channels_s3=64, in_channels_s4=128, in_channels_s5=256, out_channels=256):
+    """逐级融合特征金字塔 (PANet 架构：融合 S5, S4, S3 以及高分辨率的 S2)"""
+    def __init__(self, in_channels_list=[32, 64, 128, 256], out_channels=256):
         super().__init__()
+        c2, c3, c4, c5 = in_channels_list
         
-        # 1. S5 上采样与降维 (适配 S4)
-        self.upsample_s5 = nn.Sequential(
-            nn.Conv2d(in_channels_s5, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='nearest')
-        )
-        self.fuse_s4 = nn.Sequential(
-            ConvBNReLU(in_channels_s4 + 128, 128), 
-            DepthwiseConvBlock(128, 128)
+        # ================= 1. Top-Down (语义下发) =================
+        # S5 上采样与降维 (适配 S4)
+        self.up5_4 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.fuse4 = ConvBNReLU(c5 + c4, c4, kernel_size=1, padding=0)
+
+        # S4 上采样与降维 (适配 S3)
+        self.up4_3 = nn.Upsample(scale_factor=2, mode='nearest')
+        self.fuse3 = ConvBNReLU(c4 + c3, c3, kernel_size=1, padding=0)
+
+        # ================= 2. Bottom-Up (几何上升) =================
+        self.down2_3 = ConvBNReLU(c2, c2, kernel_size=3, stride=2, padding=1)
+
+        # 最终聚合 (聚合 FPN的 S3 和 经过下采样的 S2)
+        # 将融合后的 S3 升维到最终 Head 需要的通道数 (256)
+        self.final_fuse = nn.Sequential(
+            ConvBNReLU(c3 + c2, out_channels, kernel_size=1, padding=0),
+            DepthwiseConvBlock(out_channels, out_channels, use_res=True)
         )
 
-        # 2. S4 上采样与降维 (适配 S3)
-        self.upsample_s4 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='nearest')
-        )
-        self.fuse_s3 = nn.Sequential(
-            # 将融合后的 S3 升维到最终 Head 需要的通道数 (256)
-            ConvBNReLU(in_channels_s3 + 64, out_channels),
-            DepthwiseConvBlock(out_channels, out_channels)
-        )
+    def forward(self, feat_s2, feat_s3, feat_s4, feat_s5):
+        # 阶段一：Top-down
+        f4 = self.fuse4(torch.cat([feat_s4, self.up5_4(feat_s5)], dim=1))
+        f3 = self.fuse3(torch.cat([feat_s3, self.up4_3(f4)], dim=1))
 
-    def forward(self, feat_s3, feat_s4, feat_s5):
-        # 阶段一：S5 融 S4
-        feat_s5_up = self.upsample_s5(feat_s5)
-        out_s4 = torch.cat([feat_s4, feat_s5_up], dim=1) 
-        out_s4 = self.fuse_s4(out_s4) 
-
-        # 阶段二：融合后的 S4 融 S3
-        out_s4_up = self.upsample_s4(out_s4)
-        out_final = torch.cat([feat_s3, out_s4_up], dim=1)
-        out_final = self.fuse_s3(out_final)
+        # 阶段二：Bottom-up
+        f2_down = self.down2_3(feat_s2)
         
         # 最终输出尺寸与 Stage 3 对齐 (例如 52x52)
+        out_final = self.final_fuse(torch.cat([f3, f2_down], dim=1))
         return out_final
+
 
 class RMDetector(nn.Module):
     def __init__(self):
         super().__init__()
         self.backbone = RMBackbone()
-        # 初始化时明确传入三层的通道数
-        self.neck = RMNeck(in_channels_s3=64, in_channels_s4=128, in_channels_s5=256, out_channels=256)
+        # 初始化时明确传入四层的通道数
+        self.neck = RMNeck(in_channels_list=[32, 64, 128, 256], out_channels=256)
         self.head = RMHead(in_channels=256)
 
     def forward(self, x):
-        feat_s3, feat_s4, feat_s5 = self.backbone(x)
-        fused_feat = self.neck(feat_s3, feat_s4, feat_s5)
+        feat_s2, feat_s3, feat_s4, feat_s5 = self.backbone(x)
+        fused_feat = self.neck(feat_s2, feat_s3, feat_s4, feat_s5)
         out = self.head(fused_feat)
         return out
 
@@ -169,6 +206,11 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
         # ---------------------------
         
         raw_pose = tensor[b, 5:13, grid_y, grid_x].T  
+        
+        # === 新增约束：关键点输出激活 ===
+        if is_pred:
+            raw_pose = torch.sigmoid(raw_pose) * 6.0 - 3.0
+            
         decoded_pose = torch.zeros_like(raw_pose)
         
         for i in range(4): 
@@ -200,10 +242,12 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
 
 if __name__ == "__main__":
     model = RMBackbone()
-    dummy_input = torch.randn(1, 3, 640, 640)
-    out4, out5 = model(dummy_input)
-    print(f"Stage 4 Output Shape: {out4.shape}") # 预期: [1, 128, 40, 40]
-    print(f"Stage 5 Output Shape: {out5.shape}") # 预期: [1, 256, 20, 20]
+    dummy_input = torch.randn(1, 3, 416, 416)
+    out2, out3, out4, out5 = model(dummy_input)
+    print(f"Stage 2 Output Shape: {out2.shape}") # 预期: [1, 32, 104, 104]
+    print(f"Stage 3 Output Shape: {out3.shape}") # 预期: [1, 64, 52, 52]
+    print(f"Stage 4 Output Shape: {out4.shape}") # 预期: [1, 128, 26, 26]
+    print(f"Stage 5 Output Shape: {out5.shape}") # 预期: [1, 256, 13, 13]
     
     # 实例化完整模型
     detector = RMDetector()
@@ -211,5 +255,4 @@ if __name__ == "__main__":
     
     print(f"输入形状: {dummy_input.shape}")
     print(f"输出形状: {output.shape}") 
-    # 预期输出形状: torch.Size([1, 13, 40, 40])
-    
+    # 预期输出形状: torch.Size([1, 25, 52, 52])
