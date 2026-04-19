@@ -1,7 +1,7 @@
 kielas_rm_train:
   dataset:
     raw_dir: "./data/raw"      # 确保本地有这个目录
-    purify_dir: "./data/purify"
+    purify_dir: "~/autodl-fs/purify"
     balance_dir: "./data/balance"
     datasets_dir: "./data/datasets"
     balance:
@@ -9,9 +9,9 @@ kielas_rm_train:
 
     augment:
       # --- 基础与光学增强 ---
-      brightness_prob: 0.3
+      brightness_prob: 0.5
       brightness_range: [0.9, 2.0]
-      blur_prob: 0.2              # 运动模糊概率
+      blur_prob: 0.3              # 运动模糊概率
       blur_ksize: [3, 5, 7]       # 模糊核大小选择
       hsv_prob: 0.3               # HSV色彩空间抖动概率
       hsv_h_gain: 0.015           # 色相变化幅度
@@ -21,10 +21,10 @@ kielas_rm_train:
       bloom_prob: 0.4             # 光晕/过曝模拟概率
       
       # --- 几何变换增强 ---
-      flip_prob: 0.15             # 水平翻转概率
-      scale_prob: 0.3             # 缩放概率
+      flip_prob: 0.10             # 水平翻转概率
+      scale_prob: 0.4             # 缩放概率
       scale_range: [0.8, 1.2]
-      rotate_prob: 0.2            # 旋转概率
+      rotate_prob: 0.3            # 旋转概率
       rotate_range: [-15, 15]
       translate_prob: 0.3         # 平移概率
       translate_range: 0.1        # 图像宽高比例的平移范围
@@ -32,7 +32,7 @@ kielas_rm_train:
       perspective_factor: 0.05    # 透视形变剧烈程度(0-0.2)
 
       # --- 背景替换增强 ---
-      bg_replace_prob: 0.15        # 背景替换触发概率
+      bg_replace_prob: 0.2        # 背景替换触发概率
       bg_dir: "./background"      # 背景图片存放文件夹
       bg_radius_factor: 1.5       # 约束圆半径倍数 (1.0 为刚好包围目标)
       
@@ -47,7 +47,7 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 32
-    epochs: 1
+    epochs: 500
     weight_decay: 0.0005
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -58,7 +58,7 @@ kielas_rm_train:
       path: "./model_res/best_model.pth"
 
     cache_loader:
-      load: false
+      load: true
       device: 'cpu'
     
     optimizer:
@@ -70,8 +70,8 @@ kielas_rm_train:
       # # 置信度阈值（通常是 conf_threshold = 0.5）。
       # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
       # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
-      conf_threshold: 0.8 
-      nms_iou_threshold: 0.7
+      conf_threshold: 0.6 
+      nms_iou_threshold: 0.6
 
     data:
       class_id: [0, 2, 5, 6, 8, 11]
@@ -107,6 +107,7 @@ kielas_rm_train:
       limit: 5000
       max_res: 1280
       min_res: 320
+      use_proxy: true
       proxies:
         http: "http://127.0.0.1:7897"
         https: "http://127.0.0.1:7897"

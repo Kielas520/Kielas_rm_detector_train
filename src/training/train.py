@@ -296,7 +296,8 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
-            cache_device=cache_dev           
+            cache_device=cache_dev,
+            force_no_cache=False          
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=True, 
@@ -313,7 +314,8 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
-            cache_device=cache_dev
+            cache_device=cache_dev,
+            force_no_cache=False
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
@@ -431,7 +433,7 @@ def main():
             model.load_state_dict(torch.load(best_model_path))
         else:
             console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的权重进行可视化。[/yellow]")
-            model.load_state_dict(torch.load(save_dir / "last_model.pth"))
+            model.load_state_dict(torch.load(save_dir / "last_model.pth", weights_only=True))
         
         # 2. 重新实例化 Dataset，彻底阻断与之前多进程上下文的联系
         vis_train_dataset = RMArmorDataset(
@@ -440,7 +442,8 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
-            cache_device=cache_dev
+            cache_device=cache_dev,
+            force_no_cache=True  # <--- 关键修改：告诉 Dataset 别再搬运了
         )
         
         vis_val_dataset = RMArmorDataset(
@@ -449,7 +452,8 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             grid_size=grid_size,
-            cache_device=cache_dev
+            cache_device=cache_dev,
+            force_no_cache=True  # <--- 关键修改：告诉 Dataset 别再搬运了
         )
 
         vis_train_loader = DataLoader(

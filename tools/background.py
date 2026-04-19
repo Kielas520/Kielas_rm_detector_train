@@ -34,7 +34,7 @@ class DownloadConfig:
     
     max_resolution: int = 1280
     min_resolution: int = 320
-    
+    use_proxy: bool = False
     proxies: Optional[Dict[str, str]] = field(default_factory=lambda: {
         "http": "http://127.0.0.1:7897",
         "https": "http://127.0.0.1:7897",
@@ -58,6 +58,7 @@ def sync_with_yaml(config: DownloadConfig, yaml_path: str = "config.yaml"):
                 config.limit = bg_info.get('limit', config.limit)
                 config.max_resolution = bg_info.get('max_res', config.max_resolution)
                 config.min_resolution = bg_info.get('min_res', config.min_resolution)
+                config.use_proxy = bg_info.get('use_proxy', config.use_proxy)
                 config.proxies = bg_info.get('proxies', config.proxies)
 
             # 2. 读取路径配置
@@ -108,8 +109,10 @@ def download_and_extract(config: DownloadConfig):
             console.print(f"[yellow]续传模式：从 {resume_byte / 1024**2:.2f} MB 开始...[/yellow]")
 
         try:
-            response = requests.get(config.url, headers=headers, stream=True, timeout=30, proxies=config.proxies)
-            
+            if config.use_proxy:
+                response = requests.get(config.url, headers=headers, stream=True, timeout=30, proxies=config.proxies)
+            else:
+                response = requests.get(config.url, headers=headers, stream=True, timeout=30)
             # 如果服务器不支持 Range 或文件已改变，重置下载
             if response.status_code == 200:
                 resume_byte = 0

@@ -4,7 +4,8 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 from rich.progress import track  # 添加这一行导入
-
+from rich.console import Console  # 添加这一行
+console = Console()  # 定义 console 对象
 # --- 新增：关闭 OpenCV 内部多线程与 OpenCL ---
 # 这非常关键，能防止多进程读取图片时 CPU 直接飙到 100% 并吃满内存
 cv2.setNumThreads(0)
@@ -75,7 +76,7 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
     return results
 
 class RMArmorDataset(Dataset):
-    def __init__(self, img_dir, label_dir, class_id, input_size=(320, 320), grid_size=(10, 10), transform=None, cache_device=None):
+    def __init__(self, img_dir, label_dir, class_id, input_size=(320, 320), grid_size=(10, 10), transform=None, cache_device=None, force_no_cache=False):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.input_size = input_size
@@ -89,20 +90,26 @@ class RMArmorDataset(Dataset):
         self.cache_device = cache_device
         self.use_cache = cache_device is not None
         
+        self.force_no_cache = force_no_cache
+
         if self.use_cache:
             self.imgs_cache = []
             self.targets_cache = []
             self.class_cache = []
-            
-            print(f"正在将数据集全量预加载至 {self.cache_device}...")
-            # 将每次迭代的计算逻辑提前到初始化阶段
-            for sample_name in track(self.samples, description="Caching dataset"):
-                img_tensor, target_tensor, class_tensor = self._process_sample(sample_name)
-                
-                # 移动到指定设备（内存 'cpu' 或 显存 'cuda'）
-                self.imgs_cache.append(img_tensor.to(self.cache_device))
-                self.targets_cache.append(target_tensor.to(self.cache_device))
-                self.class_cache.append(class_tensor.to(self.cache_device))
+            # 修改加载逻辑：只有当 cache_device 不为空且没有强制关闭时才预加载
+            if self.cache_device is not None and not self.force_no_cache:
+                console.print(f"正在将数据集全量预加载至 {self.cache_device}...")
+                # 将每次迭代的计算逻辑提前到初始化阶段
+                for sample_name in track(self.samples, description="Caching dataset"):
+                    img_tensor, target_tensor, class_tensor = self._process_sample(sample_name)
+                    
+                    # 移动到指定设备（内存 'cpu' 或 显存 'cuda'）
+                    self.imgs_cache.append(img_tensor.to(self.cache_device))
+                    self.targets_cache.append(target_tensor.to(self.cache_device))
+                    self.class_cache.append(class_tensor.to(self.cache_device))
+            else:
+                # 如果强制关闭了缓存，把 use_cache 设为 False，确保 __getitem__ 走动态加载
+                self.use_cache = False
 
     def _process_sample(self, sample_name):
         """将原先 __getitem__ 中的处理逻辑提取为一个独立方法"""
