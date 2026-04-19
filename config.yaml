@@ -63,7 +63,7 @@ kielas_rm_train:
     
     optimizer:
       base_lr: 0.002
-      betas: [0.900, 0.999] # 一阶矩估计的指数衰减率 将 0.9 改为 0.940
+      betas: [0.940, 0.999] # 一阶矩估计的指数衰减率 将 0.9 改为 0.940
 
     # 新增后处理配置块
     post_process:
@@ -88,7 +88,7 @@ kielas_rm_train:
       lambda_box: 1.0
       lambda_pose: 2.0
       lambda_cls: 1.5   # 新增分类损失的权重
-      alpha: 0.85
+      alpha: 0.25
       gamma: 2.0
 
     pck:
