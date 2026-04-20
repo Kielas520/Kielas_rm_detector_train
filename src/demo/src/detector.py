@@ -50,7 +50,7 @@ class Detector:
     def _inference(self, data):
         """执行推理"""
         if self.model_type == "onnx":
-            out_np = self.session.run(None, {self.input_name: x_np})[0]
+            out_np = self.session.run(None, {self.input_name: data.cpu().numpy()})[0]
             return torch.from_numpy(out_np).to(self.device)
         else:
             with torch.no_grad():
