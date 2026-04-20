@@ -55,7 +55,9 @@ class HikCamera:
         # 打开设备
         ret = self.cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
         if ret != 0: return False
-
+        # --- 新增：解除帧率限制封印 ---
+        # 关闭帧率限制，让相机能跑多快跑多快
+        self.cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", False)
         # 开始取流
         ret = self.cam.MV_CC_StartGrabbing()
         if ret != 0: return False
