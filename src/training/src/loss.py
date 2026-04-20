@@ -43,7 +43,7 @@ class DFL(nn.Module):
         loss_l = F.cross_entropy(pred_dist.transpose(1, 2), tl, reduction='none')
         loss_r = F.cross_entropy(pred_dist.transpose(1, 2), tr, reduction='none')
 
-        return (loss_l * wl + loss_r * wr).mean()
+        return (loss_l * wl + loss_r * wr).sum()
 
 class Integral(nn.Module):
     """根据概率分布求期望值（用于损失函数内的连续坐标还原）"""
@@ -128,14 +128,15 @@ class RMDetLoss(nn.Module):
         grid_y = indices[:, 1]  
         grid_x = indices[:, 2]  
 
-        # 2. 边界框损失
+        # 2. 边界框损失 (改为 sum 并全局归一化)
         pred_boxes_raw = pred[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
         target_boxes_raw = target[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
 
         pred_boxes = self._decode_pred_boxes(pred_boxes_raw, grid_y, grid_x, grid_w, grid_h)
         target_boxes = self._decode_target_boxes(target_boxes_raw, grid_y, grid_x, grid_w, grid_h)
         
-        loss_box = complete_box_iou_loss(pred_boxes, target_boxes, reduction='mean')
+        loss_box_sum = complete_box_iou_loss(pred_boxes, target_boxes, reduction='sum')
+        loss_box = loss_box_sum / global_num_pos
 
         # 3. 关键点损失 (DFL + L1 + OKS)
         pose_start_idx = 5
@@ -143,20 +144,21 @@ class RMDetLoss(nn.Module):
         
         pred_pose_raw = pred[:, pose_start_idx:pose_end_idx, :, :].permute(0, 2, 3, 1)[pos_mask]
         pred_pose_dist = pred_pose_raw.view(-1, 8, self.reg_max) 
-        
         target_pose = target[:, 5:13, :, :].permute(0, 2, 3, 1)[pos_mask]
         
-        # 将真实坐标平移，使得 0 对应负的最大偏移
         target_pose_shifted = target_pose + (self.reg_max // 2)
         target_pose_shifted = torch.clamp(target_pose_shifted, 0, self.reg_max - 1.01)
         
-        # 计算 DFL
-        loss_pose_dfl = self.dfl(pred_pose_dist, target_pose_shifted)
+        # 计算 DFL (除以 global_num_pos 和 8个关键点坐标)
+        loss_pose_dfl_sum = self.dfl(pred_pose_dist, target_pose_shifted)
+        loss_pose_dfl = loss_pose_dfl_sum / (global_num_pos * 8)
         
-        # 将预测的分布还原为连续值以计算 OKS 和 L1
         pred_pose_continuous = self.integral(pred_pose_dist) - (self.reg_max // 2)
         
-        loss_pose_l1 = self.smooth_l1(pred_pose_continuous, target_pose)
+        # L1 Loss (改为 sum 并全局归一化)
+        smooth_l1_none = nn.SmoothL1Loss(reduction='none')
+        loss_pose_l1_sum = smooth_l1_none(pred_pose_continuous, target_pose).sum()
+        loss_pose_l1 = loss_pose_l1_sum / (global_num_pos * 8)
         
         w_norm = target[:, 3, :, :][pos_mask]
         h_norm = target[:, 4, :, :][pos_mask]
@@ -164,14 +166,18 @@ class RMDetLoss(nn.Module):
         
         dists_sq = ((pred_pose_continuous - target_pose) ** 2).view(-1, 4, 2).sum(dim=-1)
         oks = torch.exp(-dists_sq / (2 * scale.unsqueeze(1) * 0.05))
-        loss_oks = 1.0 - oks.mean()
+        
+        # OKS Loss (改为 sum 并全局归一化)
+        loss_oks_sum = (1.0 - oks).sum()
+        loss_oks = loss_oks_sum / global_num_pos
         
         loss_pose = loss_pose_dfl + loss_pose_l1 + loss_oks * 0.5
 
-        # 4. 分类损失
+        # 4. 分类损失 (改为 sum 并全局归一化)
         pred_cls = pred[:, pose_end_idx : pose_end_idx + 12, :, :].permute(0, 2, 3, 1)[pos_mask]
         target_cls = target_class[:, 0, :, :][pos_mask] 
-        loss_cls = nn.CrossEntropyLoss()(pred_cls, target_cls)
+        loss_cls_sum = nn.CrossEntropyLoss(reduction='sum')(pred_cls, target_cls)
+        loss_cls = loss_cls_sum / global_num_pos
 
         total_loss = (
             self.lambda_conf * loss_conf + 

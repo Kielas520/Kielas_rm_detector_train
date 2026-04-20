@@ -2,9 +2,6 @@ import cv2
 import yaml
 import numpy as np
 from pathlib import Path
-from tools.hik_camera.src import HikCamera
-
-cap = HikCamera(0)
 
 def main():
     # 1. 读取 YAML 配置
@@ -26,7 +23,7 @@ def main():
         target_w, target_h = 416, 416
 
     # 2. 初始化相机
-    # cap = cv2.VideoCapture(0) # 如果有多个相机，请尝试 1, 2...
+    cap = cv2.VideoCapture(0) # 如果有多个相机，请尝试 1, 2...
     if not cap.isOpened():
         print("无法打开相机")
         return
