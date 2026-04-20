@@ -71,25 +71,71 @@ class SPPF(nn.Module):
         return self.cv2(torch.cat([x, y1, y2, y3], 1))
 
 class RMHead(nn.Module):
-    def __init__(self, in_channels=256, reg_max=16):
+    def __init__(self, in_channels=256, reg_max=16, num_classes=12):
         super().__init__()
         self.reg_max = reg_max
-        self.box_head = nn.Conv2d(in_channels, 5, kernel_size=1, stride=1)
-        self.pose_head = nn.Conv2d(in_channels, 8 * reg_max, kernel_size=1, stride=1)
-        self.cls_head = nn.Conv2d(in_channels, 12, kernel_size=1, stride=1) 
+        # 解耦头：分类和回归使用独立的卷积分支
+        self.cls_convs = nn.Sequential(
+            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1),
+            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1)
+        )
+        self.reg_convs = nn.Sequential(
+            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1),
+            ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1)
+        )
+        
+        self.cls_pred = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+        self.box_pred = nn.Conv2d(in_channels, 5, kernel_size=1) # conf(1) + box(4)
+        self.pose_pred = nn.Conv2d(in_channels, 8 * reg_max, kernel_size=1)
+        
+        self._initialize_biases()
+
+    def _initialize_biases(self):
+        # 偏置初始化：让初始预测概率接近 0.01，防止训练初期负样本 Loss 爆炸
+        prior_prob = 0.01
+        bias_val = -torch.log(torch.tensor((1 - prior_prob) / prior_prob))
+        nn.init.constant_(self.box_pred.bias[0], bias_val)
+        nn.init.constant_(self.cls_pred.bias, bias_val)
 
     def forward(self, x):
-        box_out = self.box_head(x)   
-        pose_out = self.pose_head(x)
-        cls_out = self.cls_head(x)
-        out = torch.cat([box_out, pose_out, cls_out], dim=1)
-        return out
+        cls_feat = self.cls_convs(x)
+        reg_feat = self.reg_convs(x)
+        return torch.cat([self.box_pred(reg_feat), self.pose_pred(reg_feat), self.cls_pred(cls_feat)], dim=1)
+
+class RMNeck(nn.Module):
+    """标准的 FPN + PAN 结构，输出 P3, P4, P5 三个尺度"""
+    def __init__(self, in_channels_list=[64, 128, 256], out_channels=256):
+        super().__init__()
+        c3, c4, c5 = in_channels_list
+        
+        # Top-down
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.conv_f5 = ConvBNReLU(c5, out_channels, 1, padding=0)
+        self.conv_f4 = ConvBNReLU(c4 + out_channels, out_channels, 1, padding=0)
+        self.conv_f3 = ConvBNReLU(c3 + out_channels, out_channels, 1, padding=0)
+        
+        # Bottom-up
+        self.down_p3 = ConvBNReLU(out_channels, out_channels, 3, stride=2, padding=1)
+        self.conv_p4 = ConvBNReLU(out_channels * 2, out_channels, 1, padding=0)
+        self.down_p4 = ConvBNReLU(out_channels, out_channels, 3, stride=2, padding=1)
+        self.conv_p5 = ConvBNReLU(out_channels + c5, out_channels, 1, padding=0)
+
+    def forward(self, s3, s4, s5):
+        # Top-down path
+        f5 = self.conv_f5(s5)
+        f4 = self.conv_f4(torch.cat([s4, self.up(f5)], 1))
+        f3 = self.conv_f3(torch.cat([s3, self.up(f4)], 1))
+        
+        # Bottom-up path
+        p3 = f3
+        p4 = self.conv_p4(torch.cat([f4, self.down_p3(p3)], 1))
+        p5 = self.conv_p5(torch.cat([f5, self.down_p4(p4)], 1))
+        return p3, p4, p5 # 对应 stride 8, 16, 32
 
 class RMBackbone(nn.Module):
     def __init__(self):
         super().__init__()
         self.stage1 = ConvBNReLU(3, 16, stride=2)
-        # 增加 Block 堆叠深度
         self.stage2 = StackedBlocks(16, 32, num_blocks=2, stride=2)   # Stride 4
         self.stage3 = StackedBlocks(32, 64, num_blocks=3, stride=2)   # Stage 3: 步长 8 (416 -> 52x52, 64通道)
         self.stage4 = StackedBlocks(64, 128, num_blocks=3, stride=2)  # Stage 4: 步长 16 (416 -> 26x26, 128通道)
@@ -105,59 +151,21 @@ class RMBackbone(nn.Module):
         feat_s5 = self.stage5(feat_s4)
         feat_s5 = self.sppf(feat_s5)
         
-        # 抛出 S2 参与底层几何特征的融合
-        return feat_s2, feat_s3, feat_s4, feat_s5
-    
-class RMNeck(nn.Module):
-    """逐级融合特征金字塔 (PANet 架构：融合 S5, S4, S3 以及高分辨率的 S2)"""
-    def __init__(self, in_channels_list=[32, 64, 128, 256], out_channels=256):
-        super().__init__()
-        c2, c3, c4, c5 = in_channels_list
-        
-        # ================= 1. Top-Down (语义下发) =================
-        # S5 上采样与降维 (适配 S4)
-        self.up5_4 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.fuse4 = ConvBNReLU(c5 + c4, c4, kernel_size=1, padding=0)
-
-        # S4 上采样与降维 (适配 S3)
-        self.up4_3 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.fuse3 = ConvBNReLU(c4 + c3, c3, kernel_size=1, padding=0)
-
-        # ================= 2. Bottom-Up (几何上升) =================
-        self.down2_3 = ConvBNReLU(c2, c2, kernel_size=3, stride=2, padding=1)
-
-        # 最终聚合 (聚合 FPN的 S3 和 经过下采样的 S2)
-        # 将融合后的 S3 升维到最终 Head 需要的通道数 (256)
-        self.final_fuse = nn.Sequential(
-            ConvBNReLU(c3 + c2, out_channels, kernel_size=1, padding=0),
-            DepthwiseConvBlock(out_channels, out_channels, use_res=True)
-        )
-
-    def forward(self, feat_s2, feat_s3, feat_s4, feat_s5):
-        # 阶段一：Top-down
-        f4 = self.fuse4(torch.cat([feat_s4, self.up5_4(feat_s5)], dim=1))
-        f3 = self.fuse3(torch.cat([feat_s3, self.up4_3(f4)], dim=1))
-
-        # 阶段二：Bottom-up
-        f2_down = self.down2_3(feat_s2)
-        
-        # 最终输出尺寸与 Stage 3 对齐 (例如 52x52)
-        out_final = self.final_fuse(torch.cat([f3, f2_down], dim=1))
-        return out_final
+        # 仅抛出 S3, S4, S5 参与 FPN 融合
+        return feat_s3, feat_s4, feat_s5
 
 class RMDetector(nn.Module):
     def __init__(self, reg_max=16):
         super().__init__()
         self.backbone = RMBackbone()
-        # 初始化时明确传入四层的通道数
-        self.neck = RMNeck(in_channels_list=[32, 64, 128, 256], out_channels=256)
-        self.head = RMHead(in_channels=256, reg_max=reg_max)
+        self.neck = RMNeck()
+        self.head = RMHead(reg_max=reg_max)
 
     def forward(self, x):
-        feat_s2, feat_s3, feat_s4, feat_s5 = self.backbone(x)
-        fused_feat = self.neck(feat_s2, feat_s3, feat_s4, feat_s5)
-        out = self.head(fused_feat)
-        return out
+        feats = self.backbone(x)
+        ps = self.neck(*feats)
+        # 对三个尺度分别预测，返回列表
+        return [self.head(p) for p in ps]
 
 def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(52, 52), reg_max=16, img_size=(416, 416)):
     batch_size = tensor.shape[0]
@@ -182,7 +190,6 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
         grid_y, grid_x = torch.nonzero(mask, as_tuple=True)
         scores = conf[b, grid_y, grid_x]
         
-        # --- 新增：解析 class_id ---
         if is_pred:
             cls_logits = tensor[b, pose_end : pose_end + 12, grid_y, grid_x].T
             classes = torch.argmax(cls_logits, dim=1).float()
@@ -237,8 +244,7 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
 if __name__ == "__main__":
     model = RMBackbone()
     dummy_input = torch.randn(1, 3, 416, 416)
-    out2, out3, out4, out5 = model(dummy_input)
-    print(f"Stage 2 Output Shape: {out2.shape}") 
+    out3, out4, out5 = model(dummy_input)
     print(f"Stage 3 Output Shape: {out3.shape}") 
     print(f"Stage 4 Output Shape: {out4.shape}") 
     print(f"Stage 5 Output Shape: {out5.shape}") 
@@ -248,5 +254,5 @@ if __name__ == "__main__":
     output = detector(dummy_input)
     
     print(f"输入形状: {dummy_input.shape}")
-    print(f"输出形状: {output.shape}") 
-    # 预期输出形状: torch.Size([1, 145, 52, 52])  (5 + 8*16 + 12 = 145)
+    print(f"输出形状 (多尺度列表): {[o.shape for o in output]}") 
+    # 预期输出形状: [torch.Size([1, 145, 52, 52]), torch.Size([1, 145, 26, 26]), torch.Size([1, 145, 13, 13])]

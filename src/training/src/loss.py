@@ -14,7 +14,7 @@ class FocalLoss(nn.Module):
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         pt = torch.exp(-bce_loss)
         
-        # 修正：为正负样本正确分配 alpha 和 (1 - alpha)
+        # 为正负样本正确分配 alpha 和 (1 - alpha)
         alpha_factor = torch.where(targets == 1.0, self.alpha, 1.0 - self.alpha)
         focal_loss = alpha_factor * (1 - pt) ** self.gamma * bce_loss
 
@@ -60,13 +60,12 @@ class Integral(nn.Module):
         return continuous_val
 
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, grid_size=(10, 10), reg_max=16):
+    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16):
         super().__init__()
         self.lambda_conf = lambda_conf
         self.lambda_box = lambda_box
         self.lambda_pose = lambda_pose 
         self.lambda_cls = lambda_cls
-        self.grid_w, self.grid_h = grid_size
         self.reg_max = reg_max
         
         self.focal_loss = FocalLoss(alpha, gamma, reduction='sum')
@@ -74,14 +73,14 @@ class RMDetLoss(nn.Module):
         self.integral = Integral(reg_max)
         self.smooth_l1 = nn.SmoothL1Loss(reduction='mean')
 
-    def _decode_pred_boxes(self, boxes, grid_y, grid_x):
+    def _decode_pred_boxes(self, boxes, grid_y, grid_x, grid_w, grid_h):
         tx = torch.sigmoid(boxes[:, 0]) * 2.0 - 0.5
         ty = torch.sigmoid(boxes[:, 1]) * 2.0 - 0.5
         w = torch.clamp(torch.sigmoid(boxes[:, 2]), min=1e-6)
         h = torch.clamp(torch.sigmoid(boxes[:, 3]), min=1e-6)
          
-        cx = (tx + grid_x) / self.grid_w
-        cy = (ty + grid_y) / self.grid_h
+        cx = (tx + grid_x) / grid_w
+        cy = (ty + grid_y) / grid_h
         
         x1 = cx - w / 2
         y1 = cy - h / 2
@@ -90,12 +89,12 @@ class RMDetLoss(nn.Module):
         
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def _decode_target_boxes(self, boxes, grid_y, grid_x):
+    def _decode_target_boxes(self, boxes, grid_y, grid_x, grid_w, grid_h):
         tx, ty = boxes[:, 0], boxes[:, 1]
         w, h = boxes[:, 2], boxes[:, 3]
         
-        cx = (tx + grid_x) / self.grid_w
-        cy = (ty + grid_y) / self.grid_h
+        cx = (tx + grid_x) / grid_w
+        cy = (ty + grid_y) / grid_h
         
         x1 = cx - w / 2
         y1 = cy - h / 2
@@ -104,8 +103,12 @@ class RMDetLoss(nn.Module):
         
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def forward(self, pred, target, target_class):
-        # 1. 置信度损失 (Sum Reduction & 正样本均值化)
+    def compute_single_scale_loss(self, pred, target, target_class):
+        """计算单个尺度的损失"""
+        # 动态获取当前尺度的网格宽高
+        grid_h, grid_w = pred.shape[2], pred.shape[3]
+        
+        # 1. 置信度损失
         pred_conf = pred[:, 0, :, :]
         target_conf = target[:, 0, :, :]
         
@@ -131,8 +134,8 @@ class RMDetLoss(nn.Module):
         pred_boxes_raw = pred[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
         target_boxes_raw = target[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
 
-        pred_boxes = self._decode_pred_boxes(pred_boxes_raw, grid_y, grid_x)
-        target_boxes = self._decode_target_boxes(target_boxes_raw, grid_y, grid_x)
+        pred_boxes = self._decode_pred_boxes(pred_boxes_raw, grid_y, grid_x, grid_w, grid_h)
+        target_boxes = self._decode_target_boxes(target_boxes_raw, grid_y, grid_x, grid_w, grid_h)
         
         loss_box = complete_box_iou_loss(pred_boxes, target_boxes, reduction='mean')
 
@@ -159,7 +162,7 @@ class RMDetLoss(nn.Module):
         
         w_norm = target[:, 3, :, :][pos_mask]
         h_norm = target[:, 4, :, :][pos_mask]
-        scale = (w_norm * self.grid_w) * (h_norm * self.grid_h) + 1e-6
+        scale = (w_norm * grid_w) * (h_norm * grid_h) + 1e-6
         
         dists_sq = ((pred_pose_continuous - target_pose) ** 2).view(-1, 4, 2).sum(dim=-1)
         oks = torch.exp(-dists_sq / (2 * scale.unsqueeze(1) * 0.05))
@@ -188,3 +191,29 @@ class RMDetLoss(nn.Module):
         }
 
         return total_loss, loss_dict
+
+    def forward(self, preds, targets, target_classes):
+        """
+        多尺度前向传播
+        preds: 包含 3 个尺度预测张量的列表 [p3, p4, p5]
+        targets: 包含 3 个尺度目标张量的列表
+        target_classes: 包含 3 个尺度类别张量的列表
+        """
+        total_loss = 0.0
+        combined_loss_dict = {
+            'loss_conf': 0.0, 
+            'loss_box': 0.0, 
+            'loss_pose': 0.0, 
+            'loss_cls': 0.0, 
+            'total_loss': 0.0
+        }
+        
+        num_scales = len(preds)
+        for i in range(num_scales):
+            loss_scale, dist_scale = self.compute_single_scale_loss(preds[i], targets[i], target_classes[i])
+            
+            total_loss += loss_scale
+            for k in combined_loss_dict:
+                combined_loss_dict[k] += dist_scale[k]
+        
+        return total_loss, combined_loss_dict

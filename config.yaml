@@ -47,19 +47,19 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 64
-    epochs: 500
+    epochs: 1
     weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
-    grid_size: [52, 52]
+    strides: [8, 16, 32] # 缩放比例
     reg_max: 16                 # <--- 新增：关键点分布偏移网格范围参数 (预测范围)，决定了网络有没有能力**“够得着”**占据大画幅的近距离装甲板角
 
     continue:
-      enabled: true
+      enabled: false
       path: "./model_res/best_model.pth"
 
     cache_loader:
-      load: true
+      load: false
       device: 'cpu'
     
     optimizer:
@@ -81,7 +81,7 @@ kielas_rm_train:
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 32
+      num_workers: 8
 
     # --- 损失函数权重 ---
     loss:
@@ -145,6 +145,6 @@ kielas_rm_demo:
   model_path: "./export_res/best_model.onnx"
   device: "cuda"
   input_size: [416, 416]
-  grid_size: [52, 52]
+  strides: [8, 16, 32]
   conf_threshold: 0.7
   nms_iou_threshold: 0.2

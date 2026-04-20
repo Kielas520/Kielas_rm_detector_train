@@ -4,6 +4,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import cv2
+import torchvision # 新增，用于跨尺度 NMS
+
 # 强制关闭 OpenCV 内部多线程与 OpenCL，防止多进程数据加载时 CPU 和内存跑满
 cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False) 
@@ -37,21 +39,34 @@ def plot_history(history, save_path):
     plt.savefig(save_path)
     plt.close()
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress):
+def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler):
     model.train()
     total_loss = 0.0
     task_id = progress.add_task(f"[cyan]Train Epoch {epoch}", total=len(dataloader))
     
     for batch_idx, (imgs, targets, class_ids) in enumerate(dataloader):
-        imgs, targets, class_ids =  imgs.to(device), targets.to(device), class_ids.to(device)
+        # imgs 是单张量，targets 和 class_ids 是多尺度列表，需要遍历移动到 device
+        imgs = imgs.to(device)
+        targets = [t.to(device) for t in targets]
+        class_ids = [c.to(device) for c in class_ids]
         
         optimizer.zero_grad()
-        preds = model(imgs)
-        loss, loss_dict = criterion(preds, targets, class_ids)
-        loss.backward()
         
+        # 开启自动混合精度 (AMP) - 前向传播
+        with torch.autocast(device_type=device.type, dtype=torch.float16):
+            preds = model(imgs) # preds 也是包含三个尺度输出的列表
+            loss, loss_dict = criterion(preds, targets, class_ids)
+            
+        # 使用 scaler 放大 loss 并进行反向传播
+        scaler.scale(loss).backward()
+        
+        # 在进行梯度裁剪前，必须先 unscale 梯度
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0) 
-        optimizer.step()
+        
+        # 使用 scaler 更新权重
+        scaler.step(optimizer)
+        scaler.update()
         
         total_loss += loss.item()
         progress.update(task_id, advance=1, description=f"[cyan]Train Epoch {epoch} | Loss: {loss.item():.4f}")
@@ -77,9 +92,6 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
             continue
             
         for gt in gt_dets:
-            # 原本 decode_tensor 返回的是 [置信度, 8个关键点坐标]（共 9 个值），所以你用 [1:] 切片正好能拿出 8 个坐标去 reshape 成 (4, 2)。
-            # 现在它返回的是 [置信度, 类别ID, 8个关键点坐标]（共 10 个值），你再用 [1:] 切片就会拿到 9 个值，当然无法 reshape 成 4x2 的矩阵了。
-            # ---> 修改这里：从索引 2 开始切片 <---
             gt_pts = gt[2:].reshape(4, 2)
             gt_center = gt_pts.mean(axis=0)
             
@@ -88,7 +100,6 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
             min_dist = float('inf')
             
             for pred in pred_dets:
-                # ---> 修改这里：从索引 2 开始切片 <---
                 pred_pts = pred[2:].reshape(4, 2)
                 pred_center = pred_pts.mean(axis=0)
                 dist = np.linalg.norm(gt_center - pred_center)
@@ -105,8 +116,58 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
                 
     return correct_kpts, total_kpts
 
+def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, nms_thresh):
+    """
+    处理多尺度的解码与跨尺度 NMS 融合
+    """
+    batch_size = preds[0].size(0)
+    gt_dets_batch = [[] for _ in range(batch_size)]
+    pred_dets_batch = [[] for _ in range(batch_size)]
+    
+    # 1. 逐个尺度解码
+    for i, s in enumerate(strides):
+        current_grid = (input_size[0] // s, input_size[1] // s)
+        
+        gt_scale = decode_tensor(targets[i], is_pred=False, class_tensor=class_ids[i], conf_threshold=0.9, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
+        pred_scale = decode_tensor(preds[i], is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
+        
+        for b in range(batch_size):
+            if len(gt_scale[b]) > 0:
+                gt_dets_batch[b].append(gt_scale[b])
+            if len(pred_scale[b]) > 0:
+                pred_dets_batch[b].append(pred_scale[b])
+                
+    final_gt_dets = []
+    final_pred_dets = []
+    
+    # 2. 拼接结果并执行跨尺度 NMS
+    for b in range(batch_size):
+        # 合并 GT
+        if len(gt_dets_batch[b]) > 0:
+            final_gt_dets.append(np.concatenate(gt_dets_batch[b], axis=0))
+        else:
+            final_gt_dets.append([])
+            
+        # 合并 Pred 并重新应用 NMS
+        if len(pred_dets_batch[b]) > 0:
+            merged_preds = np.concatenate(pred_dets_batch[b], axis=0)
+            
+            # 构建用于 torchvision.ops.nms 的 Tensor
+            scores = torch.tensor(merged_preds[:, 0])
+            pts = torch.tensor(merged_preds[:, 2:]).view(-1, 4, 2)
+            min_xy, _ = torch.min(pts, dim=1)
+            max_xy, _ = torch.max(pts, dim=1)
+            boxes = torch.cat([min_xy, max_xy], dim=1)
+            
+            keep = torchvision.ops.nms(boxes, scores, nms_thresh)
+            final_pred_dets.append(merged_preds[keep.numpy()])
+        else:
+            final_pred_dets.append([])
+            
+    return final_gt_dets, final_pred_dets
+
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch, progress, input_size, grid_size, reg_max, conf_thresh, nms_thresh, pck_cfg):
+def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -115,15 +176,19 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     task_id = progress.add_task(f"[magenta]Val Epoch {epoch}", total=len(dataloader))
     
     for imgs, targets, class_ids in dataloader:
-        imgs, targets, class_ids = imgs.to(device), targets.to(device), class_ids.to(device)
-        preds = model(imgs)
-        # 修复传参遗漏：以前只有两个参数，现在必须传 class_ids
-        loss, _ = criterion(preds, targets, class_ids)
+        imgs = imgs.to(device)
+        targets = [t.to(device) for t in targets]
+        class_ids = [c.to(device) for c in class_ids]
+        
+        # 验证阶段使用混合精度加速
+        with torch.autocast(device_type=device.type, dtype=torch.float16):
+            preds = model(imgs)
+            loss, _ = criterion(preds, targets, class_ids)
+            
         total_loss += loss.item()
         
-        # 解码张量以获取实际像素坐标
-        gt_dets = decode_tensor(targets, is_pred=False, conf_threshold=0.9, nms_iou_threshold=0.99, grid_size=grid_size, reg_max=reg_max, img_size=input_size)
-        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=grid_size, reg_max=reg_max, img_size=input_size)
+        # 多尺度解码与融合
+        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, nms_thresh)
         
         # 计算 PCK@0.5
         correct, total = calculate_pck(gt_dets, pred_dets, pck_cfg)
@@ -135,26 +200,24 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     progress.remove_task(task_id)
     
     avg_loss = total_loss / len(dataloader)
-    # 如果没有真实标签，避免除以 0
     pck_accuracy = (total_correct / total_kpts) if total_kpts > 0 else 0.0
     
     return avg_loss, pck_accuracy
 
 @torch.no_grad()
-def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, grid_size, reg_max, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
+def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
     model.eval()
     count = 0
     task_id = progress.add_task(f"[yellow]导出 {prefix} 图像...", total=num_samples)
     
     for imgs, targets, class_ids in dataloader:
         imgs = imgs.to(device)
-        targets = targets.to(device)
-        class_ids = class_ids.to(device) # 确保 class_ids 在设备上
+        targets = [t.to(device) for t in targets]
+        class_ids = [c.to(device) for c in class_ids]
         preds = model(imgs) 
         
-        # 传入 class_ids 用于真实标签的正确解码
-        gt_dets = decode_tensor(targets, is_pred=False, class_tensor=class_ids, conf_threshold=0.9, grid_size=grid_size, reg_max=reg_max, img_size=input_size)
-        pred_dets = decode_tensor(preds, is_pred=True, conf_threshold=conf_threshold, nms_iou_threshold=nms_iou_threshold, reg_max=reg_max, grid_size=grid_size, img_size=input_size)
+        # 多尺度解码与融合
+        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_threshold, nms_iou_threshold)
         
         for i in range(imgs.size(0)):
             if count >= num_samples:
@@ -167,54 +230,49 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             fig, ax = plt.subplots(1, figsize=(10, 8))
             ax.imshow(img_np)
             
-            # ---------------------------
             # 绘制真实标签 (GT - 绿色)
-            # ---------------------------
-            for det in gt_dets[i]:
-                cls_id = int(det[1])
-                pts = det[2:].reshape(4, 2)
-                cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) # 计算装甲板中心点
-                
-                ax.scatter(pts[:, 0], pts[:, 1], color='lime', s=20, zorder=3)
-                ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='lime', linewidth=2)
-                ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='lime', linewidth=2)
-                
-                # 真实类别标注 (引向左上方)
-                ax.annotate(f"GT ID: {cls_id}",
-                            xy=(cx, cy), xycoords='data',
-                            xytext=(cx - 60, cy - 40), textcoords='data',
-                            color='lime', weight='bold', fontsize=10,
-                            arrowprops=dict(arrowstyle="-", color='lime', alpha=0.7),
-                            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
+            if len(gt_dets[i]) > 0:
+                for det in gt_dets[i]:
+                    cls_id = int(det[1])
+                    pts = det[2:].reshape(4, 2)
+                    cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) 
+                    
+                    ax.scatter(pts[:, 0], pts[:, 1], color='lime', s=20, zorder=3)
+                    ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='lime', linewidth=2)
+                    ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='lime', linewidth=2)
+                    
+                    ax.annotate(f"GT ID: {cls_id}",
+                                xy=(cx, cy), xycoords='data',
+                                xytext=(cx - 60, cy - 40), textcoords='data',
+                                color='lime', weight='bold', fontsize=10,
+                                arrowprops=dict(arrowstyle="-", color='lime', alpha=0.7),
+                                bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
             
-            # ---------------------------
             # 绘制模型预测 (Pred - 红色)
-            # ---------------------------
-            for det in pred_dets[i]:
-                score = det[0]
-                cls_id = int(det[1])
-                pts = det[2:].reshape(4, 2)
-                cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) # 计算装甲板中心点
-                
-                ax.scatter(pts[:, 0], pts[:, 1], color='red', s=20, zorder=3)
-                ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='red', linewidth=2, linestyle='--')
-                ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='red', linewidth=2, linestyle='--')
-                
-                # 预测类别标注 (引向右上方)
-                ax.annotate(f"Pred ID: {cls_id}",
-                            xy=(cx, cy), xycoords='data',
-                            xytext=(cx + 60, cy - 40), textcoords='data',
-                            color='red', weight='bold', fontsize=10,
-                            arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
-                            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
-                
-                # 置信度标注 (引向右下方)
-                ax.annotate(f"Conf: {score:.2f}",
-                            xy=(cx, cy), xycoords='data',
-                            xytext=(cx + 60, cy + 40), textcoords='data',
-                            color='red', weight='bold', fontsize=10,
-                            arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
-                            bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
+            if len(pred_dets[i]) > 0:
+                for det in pred_dets[i]:
+                    score = det[0]
+                    cls_id = int(det[1])
+                    pts = det[2:].reshape(4, 2)
+                    cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1]) 
+                    
+                    ax.scatter(pts[:, 0], pts[:, 1], color='red', s=20, zorder=3)
+                    ax.plot([pts[0, 0], pts[1, 0]], [pts[0, 1], pts[1, 1]], color='red', linewidth=2, linestyle='--')
+                    ax.plot([pts[2, 0], pts[3, 0]], [pts[2, 1], pts[3, 1]], color='red', linewidth=2, linestyle='--')
+                    
+                    ax.annotate(f"Pred ID: {cls_id}",
+                                xy=(cx, cy), xycoords='data',
+                                xytext=(cx + 60, cy - 40), textcoords='data',
+                                color='red', weight='bold', fontsize=10,
+                                arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
+                                bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
+                    
+                    ax.annotate(f"Conf: {score:.2f}",
+                                xy=(cx, cy), xycoords='data',
+                                xytext=(cx + 60, cy + 40), textcoords='data',
+                                color='red', weight='bold', fontsize=10,
+                                arrowprops=dict(arrowstyle="-", color='red', alpha=0.7),
+                                bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="red", alpha=0.6))
             
             plt.title(f"{prefix} Set - Sample {count+1}\nGreen: GT | Red: Pred")
             plt.axis('off')
@@ -243,7 +301,6 @@ def main():
     cache_loader = cfg['train']['cache_loader']
     continue_cfg = cfg['train']['continue']
     
-    # 获取阈值，如果 yaml 里没写则提供默认值
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
     nms_thresh = float(post_cfg.get('nms_iou_threshold', 0.45))
 
@@ -273,17 +330,16 @@ def main():
     history = {'train': [], 'val': [], 'lr': []}
 
     input_size = tuple(train_cfg.get('input_size', [416, 416]))
-    grid_size = tuple(train_cfg.get('grid_size', [13, 13]))
-    reg_max = int(train_cfg.get('reg_max', 16)) # <--- 新增：读取 reg_max
+    # 获取多尺度 strides，默认为 [8, 16, 32]
+    strides = train_cfg.get('strides', [8, 16, 32])
+    reg_max = int(train_cfg.get('reg_max', 16)) 
 
-    # ==========================================
-    # 数据加载器配置：放弃全量预加载，回归动态加载
-    # cache_dev = torch.device('cpu')
-    # ==========================================
     if cache_load:
         cache_dev = torch.device(cache_load_device)
     else:
-        cache_dev = None 
+        cache_dev = None
+
+    scaler = torch.amp.GradScaler(device.type) 
     
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False
@@ -296,7 +352,7 @@ def main():
             data_cfg['train_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            grid_size=grid_size,
+            strides=strides, # 替换原来的 grid_size
             cache_device=cache_dev,
             force_no_cache=False          
         ),
@@ -304,7 +360,6 @@ def main():
         shuffle=True, 
         num_workers=workers,
         pin_memory=pin_mem,
-        # 保持 worker 存活，避免每个 epoch 重新开辟进程带来的 CPU 负担
         persistent_workers=True if workers > 0 else False
     )
     
@@ -314,7 +369,7 @@ def main():
             data_cfg['val_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            grid_size=grid_size,
+            strides=strides, # 替换原来的 grid_size
             cache_device=cache_dev,
             force_no_cache=False
         ),
@@ -334,6 +389,7 @@ def main():
         else:
             console.print(f"[bold yellow]警告：未找到指定的权重文件 {weight_path}，将从头开始训练。[/bold yellow]")
 
+    # 注意：新的 Loss 已动态处理 grid_size，这里无需再传入固定 grid_size
     criterion = RMDetLoss(
         loss_cfg['lambda_conf'], 
         loss_cfg['lambda_box'], 
@@ -341,33 +397,28 @@ def main():
         loss_cfg['lambda_cls'],
         loss_cfg['alpha'],
         loss_cfg['gamma'],
-        grid_size=grid_size,
-        reg_max=reg_max # <--- 修改
+        reg_max=reg_max
     ).to(device)
     
-    # ==========================================
-    # 提取学习率相关配置
-    # ==========================================
     optim_cfg = train_cfg['optimizer']
     base_lr = float(optim_cfg['base_lr'])
     betas = optim_cfg['betas']
     optimizer = optim.AdamW(
         model.parameters(), 
         lr=base_lr, 
-        betas=betas, # 一阶矩估计的指数衰减率 将 0.9 改为 0.937
+        betas=betas, 
         weight_decay=float(train_cfg['weight_decay'])
     )
 
     warmup_epochs = max(1, int(epochs * 0.05))
 
-    # 使用普通的余弦退火，T_max 为去掉 warmup 后的总训练轮数
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=epochs - warmup_epochs,          
         eta_min=1e-6     
     )
 
-    best_val_pck = 0.0       # 替换原有的 best_val_loss = float('inf')
+    best_val_pck = 0.0      
 
     console.print("[bold green]开始训练...[/bold green]")
     
@@ -382,30 +433,24 @@ def main():
         epoch_task = progress.add_task("[bold green]总体训练进度", total=epochs)
         
         for epoch in range(1, epochs + 1):
-            # --- 1. 执行训练和验证 ---
-            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress)
-            # 传入新增的解码参数
-            val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, grid_size, reg_max, conf_thresh, nms_thresh, pck_cfg)
+            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
+            # 传入多尺度 strides
+            val_loss, val_pck = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg)
             
-            # 3. 学习率调度逻辑修改
             if epoch <= warmup_epochs:
                 current_lr = base_lr * (epoch / warmup_epochs)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = current_lr
             else:
-                # 余弦退火不再依赖 val_pck，而是直接根据步数推进
-                # 注意传入的是去掉 warmup 后的相对 epoch
                 scheduler.step()
                 current_lr = optimizer.param_groups[0]['lr']
 
-            # --- 3. 记录与打印 ---
             history['train'].append(train_loss)
-            history['val'].append(val_pck) # history 这里为了方便直接存 pck
+            history['val'].append(val_pck)
             history['lr'].append(current_lr)
             
             console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Loss: {train_loss:.4f} | Val PCK@0.5: {val_pck:.4f}")
 
-            # 核心修改：以 PCK 最高作为保存最佳权重的依据
             if val_pck > best_val_pck:
                 best_val_pck = val_pck
                 torch.save(model.state_dict(), save_dir / "best_model.pth")
@@ -413,7 +458,6 @@ def main():
             
             progress.update(epoch_task, advance=1)
             
-            # 早停机制也建议根据 PCK 来，比如连续 N 个 epoch PCK 达到 0.98 以上即可停止
             if auto_stop_enabled and val_pck >= min_pck:
                 console.print(f"\n[bold yellow]验证集 PCK ({val_pck:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
@@ -426,14 +470,13 @@ def main():
             f.write("Epoch\tLR\tTrain_Loss\tVal_PCK\n")
             for i in range(len(history['train'])):
                 f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train'][i]:.6f}\t{history['val'][i]:.6f}\n")
-        # 1. 显式删除带有 persistent_workers 的 DataLoader 并强制垃圾回收，等待后台进程安全退出
+                
         del train_loader
         del val_loader
         gc.collect()
 
         console.print("\n[bold cyan]正在生成识别效果可视化图片...[/bold cyan]")
 
-        # train.py 建议修改位置
         best_model_path = save_dir / "best_model.pth"
         if best_model_path.exists():
             model.load_state_dict(torch.load(best_model_path))
@@ -441,15 +484,14 @@ def main():
             console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的权重进行可视化。[/yellow]")
             model.load_state_dict(torch.load(save_dir / "last_model.pth", weights_only=True))
         
-        # 2. 重新实例化 Dataset，彻底阻断与之前多进程上下文的联系
         vis_train_dataset = RMArmorDataset(
             data_cfg['train_img_dir'], 
             data_cfg['train_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            grid_size=grid_size,
+            strides=strides, 
             cache_device=cache_dev,
-            force_no_cache=True  # <--- 关键修改：告诉 Dataset 别再搬运了
+            force_no_cache=True 
         )
         
         vis_val_dataset = RMArmorDataset(
@@ -457,9 +499,9 @@ def main():
             data_cfg['val_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
-            grid_size=grid_size,
+            strides=strides, 
             cache_device=cache_dev,
-            force_no_cache=True  # <--- 关键修改：告诉 Dataset 别再搬运了
+            force_no_cache=True
         )
 
         vis_train_loader = DataLoader(
@@ -475,8 +517,8 @@ def main():
             num_workers=0
         )
         
-        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, grid_size=grid_size, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
-        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, grid_size=grid_size, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
+        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
+        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 

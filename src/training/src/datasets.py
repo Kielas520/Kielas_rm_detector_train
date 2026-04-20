@@ -3,9 +3,11 @@ import cv2
 import torch
 import numpy as np
 from torch.utils.data import Dataset
-from rich.progress import track  # 添加这一行导入
-from rich.console import Console  # 添加这一行
-console = Console()  # 定义 console 对象
+from rich.progress import track  
+from rich.console import Console  
+
+console = Console()  
+
 # --- 新增：关闭 OpenCV 内部多线程与 OpenCL ---
 # 这非常关键，能防止多进程读取图片时 CPU 直接飙到 100% 并吃满内存
 cv2.setNumThreads(0)
@@ -76,13 +78,17 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
     return results
 
 class RMArmorDataset(Dataset):
-    def __init__(self, img_dir, label_dir, class_id, input_size=(320, 320), grid_size=(10, 10), transform=None, cache_device=None, force_no_cache=False):
+    # 修改了初始化参数，将 grid_size 替换为 strides 列表以支持多尺度
+    def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], transform=None, cache_device=None, force_no_cache=False):
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.input_size = input_size
-        self.grid_size = grid_size
+        self.strides = strides
         self.transform = transform
         self.class_id = class_id
+        
+        # 预先计算出多尺度的 grid_size 列表 (宽度网格数, 高度网格数)
+        self.grid_sizes = [(input_size[0] // s, input_size[1] // s) for s in strides]
         
         self.samples = [f.split('.')[0] for f in os.listdir(label_dir) if f.endswith('.txt')]
         
@@ -101,12 +107,13 @@ class RMArmorDataset(Dataset):
                 console.print(f"正在将数据集全量预加载至 {self.cache_device}...")
                 # 将每次迭代的计算逻辑提前到初始化阶段
                 for sample_name in track(self.samples, description="Caching dataset"):
-                    img_tensor, target_tensor, class_tensor = self._process_sample(sample_name)
+                    img_tensor, target_tensors, class_tensors = self._process_sample(sample_name)
                     
                     # 移动到指定设备（内存 'cpu' 或 显存 'cuda'）
                     self.imgs_cache.append(img_tensor.to(self.cache_device))
-                    self.targets_cache.append(target_tensor.to(self.cache_device))
-                    self.class_cache.append(class_tensor.to(self.cache_device))
+                    # 注意：多尺度下 targets 和 classes 现在是列表
+                    self.targets_cache.append([t.to(self.cache_device) for t in target_tensors])
+                    self.class_cache.append([c.to(self.cache_device) for c in class_tensors])
             else:
                 # 如果强制关闭了缓存，把 use_cache 设为 False，确保 __getitem__ 走动态加载
                 self.use_cache = False
@@ -124,18 +131,19 @@ class RMArmorDataset(Dataset):
         scale_y = self.input_size[1] / orig_h
         img_resized = cv2.resize(img, self.input_size)
         
-        # 3. 初始化空白的目标 Tensor
-        target_tensor = np.zeros((13, self.grid_size[1], self.grid_size[0]), dtype=np.float32)
-        class_tensor = np.zeros((1, self.grid_size[1], self.grid_size[0]), dtype=np.int64)
+        # 3. 初始化多尺度的空白目标 Tensor 列表
+        target_tensors = []
+        class_tensors = []
+        for gw, gh in self.grid_sizes:
+            target_tensors.append(np.zeros((13, gh, gw), dtype=np.float32))
+            class_tensors.append(np.zeros((1, gh, gw), dtype=np.int64))
 
         # 4. 读取标签并遍历所有目标
         label_path = os.path.join(self.label_dir, f"{sample_name}.txt")
         with open(label_path, 'r') as f:
             lines = f.readlines()
             
-        # --- 新增：定义你需要保留的类别 ID 白名单 ---
-        # 假设你只需要原标签中的类别 0, 1, 2, 3, 4, 5
-        # 如果不是连续的，比如 1, 3, 5，也可以直接填入集合
+        # 定义需要保留的类别 ID 白名单
         keep_classes = set(self.class_id)
 
         for line in lines:
@@ -146,37 +154,42 @@ class RMArmorDataset(Dataset):
             parts = line.split(']')[-1].strip().split() 
             label_data = [float(x) for x in parts]
 
-            # 提取类别 ID
+            # 提取类别 ID 和可见性
             class_id = int(label_data[0])
             vis = int(label_data[1])
-            # --- 新增核心逻辑：直接拦截不需要的类别 ---
-            # # 直接跳过，不编码为目标张量，当作背景处理
-                # 核心拦截逻辑：不可见目标直接当作背景忽略
+            
+            # 核心拦截逻辑：不在白名单或不可见目标直接当作背景忽略
             if class_id not in keep_classes or vis == 0:
                 continue
             
+            # 坐标按图像缩放比例进行放缩
             for i in range(2, len(label_data)):
                 if i % 2 == 0: 
                     label_data[i] *= scale_x
                 else:          
                     label_data[i] *= scale_y
 
-            # 原本的单网格分配被移除
-            # 替换为新的多网格分配逻辑
-            targets_info = encode_multi_targets(
-                label_data, 
-                img_w=self.input_size[0], img_h=self.input_size[1], 
-                grid_w=self.grid_size[0], grid_h=self.grid_size[1]
-            )
-            
-            for target_vec, cg_x, cg_y, class_id in targets_info:
-                target_tensor[:, cg_y, cg_x] = target_vec
-                class_tensor[0, cg_y, cg_x] = class_id
+            # 遍历每一个尺度，为当前目标编码标签
+            for scale_idx, (gw, gh) in enumerate(self.grid_sizes):
+                targets_info = encode_multi_targets(
+                    label_data, 
+                    img_w=self.input_size[0], img_h=self.input_size[1], 
+                    grid_w=gw, grid_h=gh
+                )
+                
+                # 填充到对应尺度的 Tensor 中
+                for target_vec, cg_x, cg_y, cls_id in targets_info:
+                    target_tensors[scale_idx][:, cg_y, cg_x] = target_vec
+                    class_tensors[scale_idx][0, cg_y, cg_x] = cls_id
 
         # 5. 转为 Tensor 并归一化
         img_tensor = torch.from_numpy(img_resized.transpose(2, 0, 1)).float() / 255.0
         
-        return img_tensor, torch.from_numpy(target_tensor), torch.from_numpy(class_tensor)
+        # 将列表中的 numpy 数组统一转为 torch.Tensor
+        target_tensors = [torch.from_numpy(t) for t in target_tensors]
+        class_tensors = [torch.from_numpy(c) for c in class_tensors]
+        
+        return img_tensor, target_tensors, class_tensors
 
     def __len__(self):
         return len(self.samples)
