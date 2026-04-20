@@ -115,7 +115,7 @@ kielas_rm_train:
 
 kielas_rm_export:
   # 权重文件路径
-  weights: "./model_res_300/best_model.pth"
+  weights: "./model_res/best_model.pth"
   # 导出模型存放目录
   output_dir: "./export_res"
   # 导出格式列表，支持 "onnx", "torchscript"

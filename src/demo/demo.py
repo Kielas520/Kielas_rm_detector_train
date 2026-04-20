@@ -6,6 +6,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.status import Status
 from rich.panel import Panel
+from rich import print as rprint
 import torchvision
 # 1. 导入模型组件
 # 路径：src -> training -> src -> model.py
@@ -21,6 +22,7 @@ class InferenceEngine:
     def __init__(self, cfg):
         self.type = cfg['model_type'].lower()
         self.device = torch.device(cfg.get('device', 'cpu'))
+        rprint(f"已加载到 {self.device}")
         self.model_path = Path(cfg['model_path'])
         
         if not self.model_path.exists():

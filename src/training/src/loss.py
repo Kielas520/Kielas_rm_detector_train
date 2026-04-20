@@ -214,4 +214,4 @@ class RMDetLoss(nn.Module):
             for k in combined_loss_dict:
                 combined_loss_dict[k] += dist_scale[k]
         
-        return total_loss, combined_loss_dict
+        return total_loss / num_scales, combined_loss_dict
