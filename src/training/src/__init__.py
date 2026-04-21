@@ -1,7 +1,7 @@
 # training/src/__init__.py
 
 # 1. 导入核心组件
-from .model import RMDetector, decode_tensor
+from .model import RMDetector, decode_tensor, keypoint_nms
 from .loss import RMDetLoss
 from .datasets import RMArmorDataset
 
@@ -14,7 +14,8 @@ from .datasets import RMArmorDataset
 # 模型与结构
 MODEL_COMPONENTS = [
     'RMDetector',
-    'decode_tensor'
+    'decode_tensor',
+    'keypoint_nms'
 ]
 
 # 训练逻辑

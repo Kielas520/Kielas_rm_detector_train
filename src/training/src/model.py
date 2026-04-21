@@ -3,6 +3,58 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 
+def keypoint_nms(pts, scores, dist_thresh=15.0):
+    """
+    基于关键点最小欧氏距离的 NMS
+    pts: [N, 8] (4个关键点的展平坐标) 或 [N, 4, 2]
+    scores: [N] (置信度)
+    dist_thresh: 判定为共享灯条/角点的最小像素距离阈值
+    """
+    if pts.numel() == 0:
+        return torch.empty((0,), dtype=torch.int64, device=pts.device)
+
+    pts = pts.view(-1, 4, 2)
+    # 按置信度降序排列
+    sorted_indices = torch.argsort(scores, descending=True)
+    pts = pts[sorted_indices]
+    
+    keep = []
+    suppressed = torch.zeros(len(pts), dtype=torch.bool, device=pts.device)
+
+    for i in range(len(pts)):
+        if suppressed[i]:
+            continue
+        
+        keep.append(sorted_indices[i])
+        
+        if i == len(pts) - 1:
+            break
+            
+        # 仅与尚未被抑制的检测框进行比较
+        remaining_indices = torch.arange(i + 1, len(pts), device=pts.device)
+        valid_mask = ~suppressed[remaining_indices]
+        valid_indices = remaining_indices[valid_mask]
+        
+        if len(valid_indices) == 0:
+            continue
+
+        pts_i = pts[i]               # [4, 2]
+        pts_j = pts[valid_indices]   # [M, 4, 2]
+        
+        # 计算 pts_i 的 4 个点与 pts_j 的 4 个点之间的所有两两距离
+        # 扩展维度进行广播计算:
+        # pts_i -> [1, 4, 1, 2], pts_j -> [M, 1, 4, 2]
+        diff = pts_i.unsqueeze(0).unsqueeze(2) - pts_j.unsqueeze(1) 
+        dists = torch.norm(diff, dim=-1) # [M, 4, 4]
+        
+        # 提取每对装甲板之间的最小关键点距离
+        min_dists = dists.view(len(valid_indices), -1).min(dim=1)[0] # [M]
+        
+        # 如果最小点距小于阈值，说明共享了灯条，触发抑制
+        suppressed[valid_indices[min_dists < dist_thresh]] = True
+
+    return torch.tensor(keep, dtype=torch.int64, device=pts.device)
+
 class ConvBNReLU(nn.Module):
     """标准的卷积块，支持调整 kernel_size 和 padding"""
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
@@ -167,7 +219,7 @@ class RMDetector(nn.Module):
         # 对三个尺度分别预测，返回列表
         return [self.head(p) for p in ps]
 
-def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, nms_iou_threshold=0.45, grid_size=(52, 52), reg_max=16, img_size=(416, 416)):
+def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, kpt_dist_thresh = 15.0, grid_size=(52, 52), reg_max=16, img_size=(416, 416)):
     batch_size = tensor.shape[0]
     grid_w, grid_h = grid_size
     img_w, img_h = img_size
@@ -224,13 +276,10 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, n
             
             decoded_pose[:, i*2] = px_norm * img_w
             decoded_pose[:, i*2 + 1] = py_norm * img_h
-            
-        pts = decoded_pose.view(-1, 4, 2)
-        min_xy, _ = torch.min(pts, dim=1) 
-        max_xy, _ = torch.max(pts, dim=1) 
-        boxes_for_nms = torch.cat([min_xy, max_xy], dim=1)
         
-        keep_idx = torchvision.ops.nms(boxes_for_nms, scores, nms_iou_threshold)
+        # 替换为基于关键点距离的 NMS，阈值设为 15 个像素（可根据实际画面大小微调）
+        
+        keep_idx = keypoint_nms(decoded_pose, scores, dist_thresh=kpt_dist_thresh)
         
         scores = scores[keep_idx]
         classes = classes[keep_idx] 

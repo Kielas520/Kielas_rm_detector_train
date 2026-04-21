@@ -72,7 +72,7 @@ kielas_rm_train:
       # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
       # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
       conf_threshold: 0.5 
-      nms_iou_threshold: 0.6
+      kpt_dist_thresh: 15.0
 
     data:
       class_id: [0, 2, 5, 6, 8, 11]
@@ -111,7 +111,7 @@ kielas_rm_train:
     # --- 新增：提前停止机制 ---
     early_stopping:
       enabled: true        # 是否开启自动停止
-      min_score: 0.98        # 验证集 pck 高于此值就停止训练
+      min_score: 0.95        # 验证集 pck 高于此值就停止训练
 
   tools:
     background:
@@ -159,4 +159,4 @@ kielas_rm_demo:
   input_size: [416, 416]
   strides: [8, 16, 32]
   conf_threshold: 0.7
-  nms_iou_threshold: 0.2
+  kpt_dist_thresh: 15.0

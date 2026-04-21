@@ -168,7 +168,7 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
                 
     return correct_kpts, total_kpts, correct_ids, total_gts
 
-def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, nms_thresh):
+def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh):
     """
     处理多尺度的解码与跨尺度 NMS 融合
     """
@@ -180,8 +180,8 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     for i, s in enumerate(strides):
         current_grid = (input_size[0] // s, input_size[1] // s)
         
-        gt_scale = decode_tensor(targets[i], is_pred=False, class_tensor=class_ids[i], conf_threshold=0.9, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
-        pred_scale = decode_tensor(preds[i], is_pred=True, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
+        gt_scale = decode_tensor(targets[i], is_pred=False, class_tensor=class_ids[i], conf_threshold=0.9, kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
+        pred_scale = decode_tensor(preds[i], is_pred=True, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, reg_max=reg_max, img_size=input_size)
         
         for b in range(batch_size):
             if len(gt_scale[b]) > 0:
@@ -206,23 +206,20 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
             gt_boxes = torch.cat([gt_min_xy, gt_max_xy], dim=1)
             
             # 对 GT 使用较严格的 NMS 去重
-            keep_gt = torchvision.ops.nms(gt_boxes, gt_scores, 0.3)
+            keep_gt = torchvision.ops.nms(gt_boxes, gt_scores, 0.1)
             final_gt_dets.append(merged_gts[keep_gt.numpy()])
         else:
             final_gt_dets.append([])
             
-        # --- 合并 Pred 并重新应用 NMS (保持不变) ---
+        # --- 合并 Pred 并重新应用 Keypoint NMS ---
         if len(pred_dets_batch[b]) > 0:
             merged_preds = np.concatenate(pred_dets_batch[b], axis=0)
             
-            # 构建用于 torchvision.ops.nms 的 Tensor
             scores = torch.tensor(merged_preds[:, 0])
-            pts = torch.tensor(merged_preds[:, 2:]).view(-1, 4, 2)
-            min_xy, _ = torch.min(pts, dim=1)
-            max_xy, _ = torch.max(pts, dim=1)
-            boxes = torch.cat([min_xy, max_xy], dim=1)
+            pts = torch.tensor(merged_preds[:, 2:]) # 形状 [N, 8]
             
-            keep = torchvision.ops.nms(boxes, scores, nms_thresh)
+            # 使用关键点 NMS，跨尺度重叠也会因为角点距离过近被抑制
+            keep = keypoint_nms(pts, scores, kpt_dist_thresh)
             final_pred_dets.append(merged_preds[keep.numpy()])
         else:
             final_pred_dets.append([])
@@ -230,7 +227,7 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     return final_gt_dets, final_pred_dets
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg):
+def validate(model, dataloader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg):
     model.eval()
     total_loss = 0.0
     total_correct_kpts = 0
@@ -253,7 +250,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         total_loss += loss.item()
         
         # 多尺度解码与融合
-        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, nms_thresh)
+        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh)
         
         # 计算 PCK@0.5 与 ID_Acc
         correct_k, total_k, correct_id, total_gt = calculate_pck(gt_dets, pred_dets, pck_cfg)
@@ -273,7 +270,7 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     return avg_loss, pck_accuracy, id_accuracy
 
 @torch.no_grad()
-def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, nms_iou_threshold=0.45):
+def visualize_predictions(model, dataloader, device, save_dir, prefix, progress, input_size, strides, reg_max, num_samples=5, conf_threshold=0.5, kpt_dist_thresh=14.5):
     model.eval()
     count = 0
     task_id = progress.add_task(f"[yellow]导出 {prefix} 图像...", total=num_samples)
@@ -285,7 +282,7 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
         preds = model(imgs) 
         
         # 多尺度解码与融合
-        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_threshold, nms_iou_threshold)
+        gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_threshold, kpt_dist_thresh)
         
         for i in range(imgs.size(0)):
             if count >= num_samples:
@@ -370,7 +367,7 @@ def main():
     continue_cfg = cfg['train']['continue']
     
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
-    nms_thresh = float(post_cfg.get('nms_iou_threshold', 0.45))
+    kpt_dist_thresh = float(post_cfg.get('kpt_dist_thresh', 15.0))
 
     cache_load = cache_loader.get('load', False)
     cache_load_device = cache_loader.get('device', 'cpu')
@@ -549,7 +546,7 @@ def main():
             
             # 接收带有分类/分项Loss的字典
             epoch_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
-            val_loss, val_pck, val_id_acc = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, nms_thresh, pck_cfg)
+            val_loss, val_pck, val_id_acc = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg)
             
             if epoch <= warmup_epochs:
                 current_lr = base_lr * (epoch / warmup_epochs)
@@ -574,8 +571,22 @@ def main():
             history['val_score'].append(val_score)
             history['lr'].append(current_lr)
             
-            console.print(f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | LR: {current_lr:.6f} | Train Total: {epoch_losses['total_loss']:.4f} | PCK: {val_pck:.4f} | ID Acc: {val_id_acc:.4f} | Score: {val_score:.4f}")
-
+            # 分两行打印：第一行打印所有的 loss，第二行打印验证集指标和学习率
+            console.print(
+                f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | "
+                f"Train Total: {epoch_losses['total_loss']:.4f} | "
+                f"Conf: {epoch_losses['loss_conf']:.4f} | "
+                f"Box: {epoch_losses['loss_box']:.4f} | "
+                f"Pose: {epoch_losses['loss_pose']:.4f} | "
+                f"Cls: {epoch_losses['loss_cls']:.4f}"
+            )
+            console.print(
+                f"             [bold magenta]↳[/bold magenta] LR: {current_lr:.6f} | "
+                f"Val PCK: {val_pck:.4f} | "
+                f"Val ID Acc: {val_id_acc:.4f} | "
+                f"Val Score: {val_score:.4f}"
+            )
+            
             # 依据综合得分决定是否保存最优模型
             if val_score > best_val_score:
                 best_val_score = val_score
@@ -648,8 +659,8 @@ def main():
             num_workers=0
         )
         
-        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
-        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, nms_iou_threshold=nms_thresh)
+        visualize_predictions(model, vis_train_loader, device, save_dir, prefix="train", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh)
+        visualize_predictions(model, vis_val_loader, device, save_dir, prefix="val", progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh)
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 
