@@ -28,7 +28,7 @@ class AugmentConfig:
     brightness_prob: float = 0.8
     brightness_range: Tuple[float, float] = (0.6, 1.4)
     blur_prob: float = 0.3
-    blur_ksize: List[int] = None
+    blur_ksize: List[int] = None # type: ignore
     hsv_prob: float = 0.5
     hsv_h_gain: float = 0.015
     hsv_s_gain: float = 0.4
@@ -117,7 +117,7 @@ def format_labels(labels):
         new_lines.append(f"{lab['class_id']} {lab['vis']} {coords_str}")
     return new_lines
 
-def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
+def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None): # type: ignore
     aug_img = img.copy()
     aug_labels = copy.deepcopy(labels)
     h, w = aug_img.shape[:2]
@@ -199,22 +199,22 @@ def process_data(img, labels, cfg: AugmentConfig, bg_paths: list = None):
     if random.random() < cfg.translate_prob:
         tx = random.uniform(-cfg.translate_range, cfg.translate_range) * w
         ty = random.uniform(-cfg.translate_range, cfg.translate_range) * h
-        M_trans = np.float32([[1, 0, tx], [0, 1, ty]])
-        aug_img = cv2.warpAffine(aug_img, M_trans, (w, h), borderValue=(0,0,0))
+        M_trans = np.float32([[1, 0, tx], [0, 1, ty]]) # type: ignore
+        aug_img = cv2.warpAffine(aug_img, M_trans, (w, h), borderValue=(0,0,0)) # type: ignore
         for lab in aug_labels:
             lab['pts'][:, 0] += tx
             lab['pts'][:, 1] += ty
 
     if random.random() < cfg.perspective_prob:
         margin = min(h, w) * cfg.perspective_factor
-        pts1 = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+        pts1 = np.float32([[0, 0], [w, 0], [0, h], [w, h]]) # type: ignore
         pts2 = np.float32([
             [random.uniform(-margin, margin), random.uniform(-margin, margin)],
             [w + random.uniform(-margin, margin), random.uniform(-margin, margin)],
             [random.uniform(-margin, margin), h + random.uniform(-margin, margin)],
             [w + random.uniform(-margin, margin), h + random.uniform(-margin, margin)]
-        ])
-        M_persp = cv2.getPerspectiveTransform(pts1, pts2)
+        ]) # type: ignore
+        M_persp = cv2.getPerspectiveTransform(pts1, pts2) # type: ignore
         aug_img = cv2.warpPerspective(aug_img, M_persp, (w, h), borderValue=(0,0,0))
         
         for lab in aug_labels:
@@ -366,7 +366,7 @@ def augment_worker(task_queue: Queue, progress: Progress, task_id, cfg: AugmentC
         progress.advance(task_id)
         task_queue.task_done()
 
-def run_augment_pipeline(dataset_dir: str, num_workers: int = 8, cfg: AugmentConfig = None):
+def run_augment_pipeline(dataset_dir: str, num_workers: int = 8, cfg: AugmentConfig = None): # type: ignore
     if cfg is None: cfg = AugmentConfig()
     base_path = Path(dataset_dir)
     

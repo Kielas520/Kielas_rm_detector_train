@@ -3,7 +3,7 @@ import cv2
 import shutil
 from pathlib import Path
 
-def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = None):
+def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = None): # type: ignore
     if if_flag is None:
         if_flag = [0, 0]
         
@@ -145,18 +145,18 @@ def visualize_dataset(root_path: str, data_type: str = "train", if_flag: list = 
                                     else: info_text = f"s:{flag_val}"
 
                             # 1. 绘制目标线段 (左右垂直边缘)
-                            cv2.line(img, pts[1], pts[0], box_color, 2)
-                            cv2.line(img, pts[3], pts[2], box_color, 2)
+                            cv2.line(img, pts[1], pts[0], box_color, 2) # type: ignore
+                            cv2.line(img, pts[3], pts[2], box_color, 2) # type: ignore
                             
                             # 2. 绘制各角点坐标
-                            for p in pts:
+                            for p in pts: # type: ignore
                                 cv2.circle(img, p, 4, box_color, -1)
                                 cv2.putText(img, f"({p[0]},{p[1]})", (p[0] + 5, p[1] - 5), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
 
                             # 3. 在每个目标左上方绘制 ID 和 状态信息
-                            min_x = min(p[0] for p in pts)
-                            min_y = min(p[1] for p in pts)
+                            min_x = min(p[0] for p in pts) # type: ignore
+                            min_y = min(p[1] for p in pts) # type: ignore
                             
                             target_label = f"id:{class_id} {info_text}" if info_text else f"id:{class_id}"
                             

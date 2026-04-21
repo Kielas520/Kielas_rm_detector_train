@@ -198,7 +198,7 @@ def purify_dataset_pipeline(raw_dir: str, output_dir: str, distance_threshold: f
                     continue
 
                 if last_saved_center is not None:
-                    distance = calculate_distance(current_center, last_saved_center)
+                    distance = calculate_distance(current_center, last_saved_center) # type: ignore
                     if distance < distance_threshold:
                         stats["distance_skipped"] += 1
                         progress.advance(main_task)
