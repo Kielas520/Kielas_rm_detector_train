@@ -4,7 +4,7 @@ import numpy as np
 import yaml
 from pathlib import Path
 
-# 新增 keypoint_nms 导入
+# 导入精简模型及其关键点 NMS 与解码组件
 from src.training.src.model import RMDetector, decode_tensor, keypoint_nms
 
 class Detector:
@@ -19,9 +19,10 @@ class Detector:
         self.device = torch.device(self.cfg.get('device', 'cpu'))
         self.input_size = tuple(self.cfg['input_size'])  # (w, h)
         
-        # 替换 grid_size 为 strides 和 reg_max
+        # 彻底替换历史参数
         self.strides = self.cfg.get('strides', [8, 16, 32])
         self.reg_max = self.cfg.get('reg_max', 16)
+        self.num_classes = self.cfg.get('num_classes', 12)
         
         self.conf_threshold = self.cfg['conf_threshold']
         self.kpt_dist_thresh = self.cfg.get('kpt_dist_thresh', 15.0)
@@ -37,7 +38,7 @@ class Detector:
             self.session = ort.InferenceSession(model_path, providers=providers)
             self.input_name = self.session.get_inputs()[0].name
         elif self.model_type == "pytorch":
-            self.model = RMDetector().to(self.device)
+            self.model = RMDetector(reg_max=self.reg_max, num_classes=self.num_classes).to(self.device)
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
             self.model.eval()
         elif self.model_type == "torchscript":
@@ -99,7 +100,8 @@ class Detector:
                 kpt_dist_thresh=self.kpt_dist_thresh, 
                 grid_size=current_grid, 
                 reg_max=self.reg_max,
-                img_size=self.input_size
+                img_size=self.input_size,
+                num_classes=self.num_classes
             )
             
             # 取 batch=0 的结果

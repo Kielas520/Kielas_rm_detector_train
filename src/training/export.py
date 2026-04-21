@@ -81,8 +81,11 @@ def main():
     output_dir = Path(cfg['output_dir'])
     formats = cfg.get('formats', [])
     input_size = cfg.get('input_size', [416, 416])
-    # --- 修改点 2: 读取 reg_max，默认给 16 ---
+    
+    # --- 修改点 2: 读取 reg_max 与 num_classes ---
     reg_max = cfg.get('reg_max', 16)
+    num_classes = cfg.get('num_classes', 12)
+
     if not weights_path.exists():
         console.print(f"[bold red]错误：权重文件不存在 {weights_path.absolute()}[/bold red]")
         return
@@ -91,8 +94,9 @@ def main():
     
     console.print("[*] [bold cyan]正在初始化模型并加载权重...[/bold cyan]")
     device = torch.device('cpu') 
-    # --- 修改点 3: 实例化时传入 reg_max ---
-    model = RMDetector(reg_max=reg_max)
+    
+    # --- 修改点 3: 实例化时传入 reg_max 和 num_classes ---
+    model = RMDetector(reg_max=reg_max, num_classes=num_classes)
     model.load_state_dict(torch.load(weights_path, map_location=device))
     
     model.eval() 

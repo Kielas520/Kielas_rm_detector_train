@@ -6,15 +6,15 @@ import torchvision
 def keypoint_nms(pts, scores, dist_thresh=15.0):
     """
     基于关键点最小欧氏距离的 NMS
-    pts: [N, 8] (4个关键点的展平坐标) 或 [N, 4, 2]
-    scores: [N] (置信度)
+    pts: [N, 4, 2]
+    scores: [N] (综合分类得分)
     dist_thresh: 判定为共享灯条/角点的最小像素距离阈值
     """
     if pts.numel() == 0:
         return torch.empty((0,), dtype=torch.int64, device=pts.device)
 
     pts = pts.view(-1, 4, 2)
-    # 按置信度降序排列
+    # 按得分降序排列
     sorted_indices = torch.argsort(scores, descending=True)
     pts = pts[sorted_indices]
     
@@ -30,7 +30,6 @@ def keypoint_nms(pts, scores, dist_thresh=15.0):
         if i == len(pts) - 1:
             break
             
-        # 仅与尚未被抑制的检测框进行比较
         remaining_indices = torch.arange(i + 1, len(pts), device=pts.device)
         valid_mask = ~suppressed[remaining_indices]
         valid_indices = remaining_indices[valid_mask]
@@ -38,17 +37,15 @@ def keypoint_nms(pts, scores, dist_thresh=15.0):
         if len(valid_indices) == 0:
             continue
 
-        pts_i = pts[i]               # [4, 2]
-        pts_j = pts[valid_indices]   # [M, 4, 2]
+        pts_i = pts[i]               
+        pts_j = pts[valid_indices]   
         
-        # 计算 pts_i 的 4 个点与 pts_j 的 4 个点之间的所有两两距离
-        # 扩展维度进行广播计算:
-        # pts_i -> [1, 4, 1, 2], pts_j -> [M, 1, 4, 2]
+        # 计算两两关键点距离 [M, 4, 4]
         diff = pts_i.unsqueeze(0).unsqueeze(2) - pts_j.unsqueeze(1) 
-        dists = torch.norm(diff, dim=-1) # [M, 4, 4]
+        dists = torch.norm(diff, dim=-1) 
         
         # 提取每对装甲板之间的最小关键点距离
-        min_dists = dists.view(len(valid_indices), -1).min(dim=1)[0] # [M]
+        min_dists = dists.view(len(valid_indices), -1).min(dim=1)[0] 
         
         # 如果最小点距小于阈值，说明共享了灯条，触发抑制
         suppressed[valid_indices[min_dists < dist_thresh]] = True
@@ -123,9 +120,14 @@ class SPPF(nn.Module):
         return self.cv2(torch.cat([x, y1, y2, y3], 1))
 
 class RMHead(nn.Module):
+    """
+    精简后的 Head：取消独立 Box 分支，合并分类与置信度
+    """
     def __init__(self, in_channels=256, reg_max=16, num_classes=12):
         super().__init__()
         self.reg_max = reg_max
+        self.num_classes = num_classes
+        
         # 解耦头：分类和回归使用独立的卷积分支
         self.cls_convs = nn.Sequential(
             ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1),
@@ -136,8 +138,9 @@ class RMHead(nn.Module):
             ConvBNReLU(in_channels, in_channels, kernel_size=3, padding=1)
         )
         
+        # 分类分支同时承担正负样本判别任务
         self.cls_pred = nn.Conv2d(in_channels, num_classes, kernel_size=1)
-        self.box_pred = nn.Conv2d(in_channels, 5, kernel_size=1) # conf(1) + box(4)
+        # 回归分支仅输出 8 个关键点的 DFL 分布
         self.pose_pred = nn.Conv2d(in_channels, 8 * reg_max, kernel_size=1)
         
         self._initialize_biases()
@@ -146,13 +149,14 @@ class RMHead(nn.Module):
         # 偏置初始化：让初始预测概率接近 0.01，防止训练初期负样本 Loss 爆炸
         prior_prob = 0.01
         bias_val = -torch.log(torch.tensor((1 - prior_prob) / prior_prob))
-        nn.init.constant_(self.box_pred.bias[0], bias_val) # type: ignore
+        # 初始状态下所有类别概率均接近 prior_prob
         nn.init.constant_(self.cls_pred.bias, bias_val) # type: ignore
 
     def forward(self, x):
         cls_feat = self.cls_convs(x)
         reg_feat = self.reg_convs(x)
-        return torch.cat([self.box_pred(reg_feat), self.pose_pred(reg_feat), self.cls_pred(cls_feat)], dim=1)
+        # 输出顺序：[batch, num_classes + 8*reg_max, h, w]
+        return torch.cat([self.cls_pred(cls_feat), self.pose_pred(reg_feat)], dim=1)
 
 class RMNeck(nn.Module):
     """标准的 FPN + PAN 结构，输出 P3, P4, P5 三个尺度"""
@@ -182,7 +186,7 @@ class RMNeck(nn.Module):
         p3 = f3
         p4 = self.conv_p4(torch.cat([f4, self.down_p3(p3)], 1))
         p5 = self.conv_p5(torch.cat([f5, self.down_p4(p4)], 1))
-        return p3, p4, p5 # 对应 stride 8, 16, 32
+        return p3, p4, p5 
 
 class RMBackbone(nn.Module):
     def __init__(self):
@@ -207,11 +211,11 @@ class RMBackbone(nn.Module):
         return feat_s3, feat_s4, feat_s5
 
 class RMDetector(nn.Module):
-    def __init__(self, reg_max=16):
+    def __init__(self, reg_max=16, num_classes=12):
         super().__init__()
         self.backbone = RMBackbone()
         self.neck = RMNeck()
-        self.head = RMHead(reg_max=reg_max)
+        self.head = RMHead(reg_max=reg_max, num_classes=num_classes)
 
     def forward(self, x):
         feats = self.backbone(x)
@@ -219,19 +223,25 @@ class RMDetector(nn.Module):
         # 对三个尺度分别预测，返回列表
         return [self.head(p) for p in ps]
 
-def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, kpt_dist_thresh = 15.0, grid_size=(52, 52), reg_max=16, img_size=(416, 416)):
+def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, kpt_dist_thresh=15.0, grid_size=(52, 52), reg_max=16, img_size=(416, 416), num_classes=12):
     batch_size = tensor.shape[0]
     grid_w, grid_h = grid_size
     img_w, img_h = img_size
     
     if is_pred:
-        conf = torch.sigmoid(tensor[:, 0, :, :])
+        # 预测模式提取分类与置信度
+        cls_logits = tensor[:, :num_classes, :, :]
+        cls_scores = torch.sigmoid(cls_logits)
+        conf, classes = torch.max(cls_scores, dim=1)
     else:
+        # GT 模式：直接读取首位置信度
         conf = tensor[:, 0, :, :]
+        if class_tensor is not None:
+            classes = class_tensor[:, 0, :, :].float()
+        else:
+            classes = torch.zeros_like(conf)
         
     batch_results = []
-    pose_start = 5
-    pose_end = 5 + 8 * reg_max
     
     for b in range(batch_size):
         mask = conf[b] >= conf_threshold
@@ -241,67 +251,51 @@ def decode_tensor(tensor, is_pred=True, class_tensor=None, conf_threshold=0.5, k
             
         grid_y, grid_x = torch.nonzero(mask, as_tuple=True)
         scores = conf[b, grid_y, grid_x]
+        item_classes = classes[b, grid_y, grid_x].float()
         
         if is_pred:
-            cls_logits = tensor[b, pose_end : pose_end + 12, grid_y, grid_x].T
-            classes = torch.argmax(cls_logits, dim=1).float()
-        else:
-            if class_tensor is not None:
-                classes = class_tensor[b, 0, grid_y, grid_x].float()
-            else:
-                classes = torch.zeros_like(scores)
-        
-        if is_pred:
-            # 提取 DFL 分布并还原为偏移坐标
+            # 预测模式下的连续分布还原
+            pose_start = num_classes
+            pose_end = num_classes + 8 * reg_max
             raw_pose_dist = tensor[b, pose_start:pose_end, grid_y, grid_x].T 
             raw_pose_dist = raw_pose_dist.view(-1, 8, reg_max)
             
             prob = F.softmax(raw_pose_dist, dim=-1)
             project = torch.arange(reg_max, dtype=torch.float32, device=tensor.device)
-            continuous_pose = (prob * project).sum(dim=-1)
-            
-            # 平移回实际偏移量
-            decoded_pose_offset = continuous_pose - (reg_max // 2)
+            decoded_pose_offset = (prob * project).sum(dim=-1) - (reg_max // 2)
         else:
-            decoded_pose_offset = tensor[b, 5:13, grid_y, grid_x].T
+            # GT 模式：自动兼容 9维 (1 conf + 8 pose) 或 13维 (1 conf + 4 box + 8 pose)
+            if tensor.shape[1] == 9:
+                decoded_pose_offset = tensor[b, 1:9, grid_y, grid_x].T
+            else:
+                decoded_pose_offset = tensor[b, 5:13, grid_y, grid_x].T
             
         decoded_pose = torch.zeros_like(decoded_pose_offset)
         
         for i in range(4): 
-            px_offset = decoded_pose_offset[:, i*2]
-            py_offset = decoded_pose_offset[:, i*2 + 1]
-            
-            px_norm = (px_offset + grid_x) / grid_w
-            py_norm = (py_offset + grid_y) / grid_h
+            px_norm = (decoded_pose_offset[:, i*2] + grid_x) / grid_w
+            py_norm = (decoded_pose_offset[:, i*2 + 1] + grid_y) / grid_h
             
             decoded_pose[:, i*2] = px_norm * img_w
             decoded_pose[:, i*2 + 1] = py_norm * img_h
         
-        # 替换为基于关键点距离的 NMS，阈值设为 15 个像素（可根据实际画面大小微调）
-        
         keep_idx = keypoint_nms(decoded_pose, scores, dist_thresh=kpt_dist_thresh)
         
-        scores = scores[keep_idx]
-        classes = classes[keep_idx] 
-        decoded_pose = decoded_pose[keep_idx]
-        
-        dets = torch.cat([scores.unsqueeze(1), classes.unsqueeze(1), decoded_pose], dim=1)
+        dets = torch.cat([
+            scores[keep_idx].unsqueeze(1), 
+            item_classes[keep_idx].unsqueeze(1), 
+            decoded_pose[keep_idx]
+        ], dim=1)
         batch_results.append(dets.detach().cpu().numpy())
         
     return batch_results
 
 if __name__ == "__main__":
-    model = RMBackbone()
+    detector = RMDetector(reg_max=16, num_classes=12)
     dummy_input = torch.randn(1, 3, 416, 416)
-    out3, out4, out5 = model(dummy_input)
-    print(f"Stage 3 Output Shape: {out3.shape}") 
-    print(f"Stage 4 Output Shape: {out4.shape}") 
-    print(f"Stage 5 Output Shape: {out5.shape}") 
-    
-    # RMDetector 实例化时默认 reg_max=16
-    detector = RMDetector(reg_max=16)
     output = detector(dummy_input)
     
     print(f"输入形状: {dummy_input.shape}")
+    # 分类(12) + 关键点(8 * 16 = 128) = 140
     print(f"输出形状 (多尺度列表): {[o.shape for o in output]}") 
-    # 预期输出形状: [torch.Size([1, 145, 52, 52]), torch.Size([1, 145, 26, 26]), torch.Size([1, 145, 13, 13])]
+    # 预期输出形状: [torch.Size([1, 140, 52, 52]), torch.Size([1, 140, 26, 26]), torch.Size([1, 140, 13, 13])]

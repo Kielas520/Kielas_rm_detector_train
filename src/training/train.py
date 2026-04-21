@@ -11,10 +11,10 @@ cv2.setNumThreads(0)
 cv2.ocl.setUseOpenCL(False) 
 
 from rich.console import Console
-from rich.prompt import Confirm, Prompt  # 新增导入 Prompt 用于多选
+from rich.prompt import Confirm, Prompt  
 from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
 import matplotlib
-matplotlib.use('Agg')  # 必须在 import pyplot 之前调用
+matplotlib.use('Agg')  
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
@@ -44,22 +44,17 @@ def save_training_curves(history, save_dir):
     
     # 单独保存各项 Loss 和 指标
     plot_and_save_curve(history['train_total'], epochs, 'Total Training Loss', 'Loss', save_dir / "loss_total.png", 'b')
-    plot_and_save_curve(history['train_conf'], epochs, 'Confidence Loss', 'Loss', save_dir / "loss_conf.png", 'orange')
-    plot_and_save_curve(history['train_box'], epochs, 'Box Loss', 'Loss', save_dir / "loss_box.png", 'green')
     plot_and_save_curve(history['train_pose'], epochs, 'Pose (Keypoints) Loss', 'Loss', save_dir / "loss_pose.png", 'purple')
     plot_and_save_curve(history['train_cls'], epochs, 'Classification Loss', 'Loss', save_dir / "loss_cls.png", 'brown')
     
     # 验证集评估指标 PCK 单独保存
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
 
-
 def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler):
     model.train()
     
     # 初始化记录各项 Loss 的字典
     epoch_losses = {
-        'loss_conf': 0.0,
-        'loss_box': 0.0,
         'loss_pose': 0.0,
         'loss_cls': 0.0,
         'total_loss': 0.0
@@ -94,7 +89,7 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, prog
         for k in epoch_losses:
             epoch_losses[k] += loss_dict[k]
             
-        progress.update(task_id, advance=1, description=f"[cyan]Train Epoch {epoch} | Total Loss: {loss.item():.4f} | Conf: {loss_dict['loss_conf']:.4f}")
+        progress.update(task_id, advance=1, description=f"[cyan]Train Epoch {epoch} | Total Loss: {loss.item():.4f} | Cls Loss: {loss_dict['loss_cls']:.4f}")
         
     progress.remove_task(task_id)
     
@@ -111,8 +106,8 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
     """
     correct_kpts = 0
     total_kpts = 0
-    correct_ids = 0  # 新增：预测正确的类别数量
-    total_gts = 0    # 新增：GT目标总数
+    correct_ids = 0  
+    total_gts = 0    
     
     target_in_range_dist = pck_cfg['target_in_range_dist']
     threshold = pck_cfg['max_pixel_threshold']
@@ -127,21 +122,19 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
         if len(pred_dets) == 0:
             continue
             
-        # --- 修复：记录已被匹配的预测框索引 ---
         matched_preds = set()
             
         for gt in gt_dets:
             gt_pts = gt[2:].reshape(4, 2)
             gt_center = gt_pts.mean(axis=0)
             
-            # 根据中心点距离寻找最佳匹配的预测框
             best_pred_idx = -1
             min_dist = float('inf')
             best_pred_pts = None
             
             for i, pred in enumerate(pred_dets):
                 if i in matched_preds:
-                    continue # 跳过已经被其他 GT 匹配掉的预测框
+                    continue 
                     
                 pred_pts = pred[2:].reshape(4, 2)
                 pred_center = pred_pts.mean(axis=0)
@@ -152,26 +145,18 @@ def calculate_pck(gt_batch, pred_batch, pck_cfg):
                     best_pred_idx = i
                     best_pred_pts = pred_pts
             
-            # 如果找到了符合条件的预测框
             if min_dist < target_in_range_dist and best_pred_idx != -1:
-                matched_preds.add(best_pred_idx) # 标记为已占用
+                matched_preds.add(best_pred_idx) 
                 
-                # 计算 4 个角点的独立欧氏距离
                 dists = np.linalg.norm(gt_pts - best_pred_pts, axis=1)
-                # 统计距离小于阈值的点数
                 correct_kpts += np.sum(dists < threshold)
                 
-                # --- 新增：如果 ID 匹配正确，累加 correct_ids ---
-                # gt[1] 和 pred_dets[best_pred_idx][1] 分别是真实类别和预测类别
                 if int(gt[1]) == int(pred_dets[best_pred_idx][1]):
                     correct_ids += 1
                 
     return correct_kpts, total_kpts, correct_ids, total_gts
 
 def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh):
-    """
-    处理多尺度的解码与跨尺度 NMS 融合
-    """
     batch_size = preds[0].size(0)
     gt_dets_batch = [[] for _ in range(batch_size)]
     pred_dets_batch = [[] for _ in range(batch_size)]
@@ -194,31 +179,26 @@ def process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg
     
     # 2. 拼接结果并执行跨尺度 NMS
     for b in range(batch_size):
-        # --- 修复：合并 GT 并执行去重 ---
         if len(gt_dets_batch[b]) > 0:
             merged_gts = np.concatenate(gt_dets_batch[b], axis=0)
             
-            # 构建用于 NMS 的 Tensor (赋予相同置信度)
             gt_scores = torch.ones(merged_gts.shape[0])
             gt_pts = torch.tensor(merged_gts[:, 2:]).view(-1, 4, 2)
             gt_min_xy, _ = torch.min(gt_pts, dim=1)
             gt_max_xy, _ = torch.max(gt_pts, dim=1)
             gt_boxes = torch.cat([gt_min_xy, gt_max_xy], dim=1)
             
-            # 对 GT 使用较严格的 NMS 去重
             keep_gt = torchvision.ops.nms(gt_boxes, gt_scores, 0.1)
             final_gt_dets.append(merged_gts[keep_gt.numpy()])
         else:
             final_gt_dets.append([])
             
-        # --- 合并 Pred 并重新应用 Keypoint NMS ---
         if len(pred_dets_batch[b]) > 0:
             merged_preds = np.concatenate(pred_dets_batch[b], axis=0)
             
             scores = torch.tensor(merged_preds[:, 0])
-            pts = torch.tensor(merged_preds[:, 2:]) # 形状 [N, 8]
+            pts = torch.tensor(merged_preds[:, 2:]) 
             
-            # 使用关键点 NMS，跨尺度重叠也会因为角点距离过近被抑制
             keep = keypoint_nms(pts, scores, kpt_dist_thresh)
             final_pred_dets.append(merged_preds[keep.numpy()])
         else:
@@ -232,8 +212,8 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
     total_loss = 0.0
     total_correct_kpts = 0
     total_kpts = 0
-    total_correct_ids = 0 # 新增
-    total_gts = 0         # 新增
+    total_correct_ids = 0 
+    total_gts = 0         
     
     task_id = progress.add_task(f"[magenta]Val Epoch {epoch}", total=len(dataloader))
     
@@ -242,17 +222,14 @@ def validate(model, dataloader, criterion, device, epoch, progress, input_size, 
         targets = [t.to(device) for t in targets]
         class_ids = [c.to(device) for c in class_ids]
         
-        # 验证阶段使用混合精度加速
         with torch.autocast(device_type=device.type, dtype=torch.float16):
             preds = model(imgs)
             loss, _ = criterion(preds, targets, class_ids)
             
         total_loss += loss.item()
         
-        # 多尺度解码与融合
         gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh)
         
-        # 计算 PCK@0.5 与 ID_Acc
         correct_k, total_k, correct_id, total_gt = calculate_pck(gt_dets, pred_dets, pck_cfg)
         total_correct_kpts += correct_k
         total_kpts += total_k
@@ -281,7 +258,6 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
         class_ids = [c.to(device) for c in class_ids]
         preds = model(imgs) 
         
-        # 多尺度解码与融合
         gt_dets, pred_dets = process_multi_scale_dets(preds, targets, class_ids, strides, input_size, reg_max, conf_threshold, kpt_dist_thresh)
         
         for i in range(imgs.size(0)):
@@ -295,7 +271,6 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
             fig, ax = plt.subplots(1, figsize=(10, 8))
             ax.imshow(img_np)
             
-            # 绘制真实标签 (GT - 绿色)
             if len(gt_dets[i]) > 0:
                 for det in gt_dets[i]:
                     cls_id = int(det[1])
@@ -313,7 +288,6 @@ def visualize_predictions(model, dataloader, device, save_dir, prefix, progress,
                                 arrowprops=dict(arrowstyle="-", color='lime', alpha=0.7),
                                 bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="lime", alpha=0.6))
             
-            # 绘制模型预测 (Pred - 红色)
             if len(pred_dets[i]) > 0:
                 for det in pred_dets[i]:
                     score = det[0]
@@ -372,7 +346,6 @@ def main():
     cache_load = cache_loader.get('load', False)
     cache_load_device = cache_loader.get('device', 'cpu')
 
-    # 提取权重和停止阈值配置
     metric_weights = train_cfg.get('metric_weights', {'pck': 0.6, 'id_acc': 0.4})
     w_pck = float(metric_weights.get('pck', 0.6))
     w_id = float(metric_weights.get('id_acc', 0.4))
@@ -383,9 +356,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
-    # 从配置中读取 scale_ranges
+    
     scale_ranges = data_cfg.get('scale_ranges', [[0, 64], [32, 128], [96, 9999]])
-    # ---------------- 目录检查与操作询问逻辑修改开始 ----------------
+    
     if save_dir.exists() and any(save_dir.iterdir()):
         choice = Prompt.ask(
             f"\n[bold yellow]输出文件夹 '{save_dir}' 已存在且非空，请选择操作：[/bold yellow]\n"
@@ -400,37 +373,31 @@ def main():
             shutil.rmtree(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
             console.print("[green]已清空历史文件夹，全新开始训练。[/green]")
-            continue_cfg['enabled'] = False  # 强制不继续
+            continue_cfg['enabled'] = False  
         elif choice == "3":
             console.print("[bold red]已取消训练任务。[/bold red]")
             return
         else:
             console.print("[green]选择了继续训练，保留现有文件夹。[/green]")
             continue_cfg['enabled'] = True
-            # 如果配置中未指定权重路径，默认使用目录下的 last_model.pth
             if not continue_cfg.get('path'):
                 continue_cfg['path'] = str(save_dir / "last_model.pth")
     else:
         save_dir.mkdir(parents=True, exist_ok=True)
-    # ---------------- 目录检查与操作询问逻辑修改结束 ----------------
     
     epochs = train_cfg['epochs']
     
-    # 修改历史字典记录项
     history = {
-            'train_total': [],
-            'train_conf': [],
-            'train_box': [],
-            'train_pose': [],
-            'train_cls': [],
-            'val_pck': [],
-            'val_id_acc': [],
-            'val_score': [],
-            'lr': []
-        }
+        'train_total': [],
+        'train_pose': [],
+        'train_cls': [],
+        'val_pck': [],
+        'val_id_acc': [],
+        'val_score': [],
+        'lr': []
+    }
 
     input_size = tuple(train_cfg.get('input_size', [416, 416]))
-    # 获取多尺度 strides，默认为 [8, 16, 32]
     strides = train_cfg.get('strides', [8, 16, 32])
     reg_max = int(train_cfg.get('reg_max', 16)) 
 
@@ -453,7 +420,7 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             strides=strides,
-            scale_ranges=scale_ranges, # 传入参数 
+            scale_ranges=scale_ranges, 
             cache_device=cache_dev,
             force_no_cache=False,
             data_name = 'train'          
@@ -472,7 +439,7 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             strides=strides,
-            scale_ranges=scale_ranges, # 传入参数 
+            scale_ranges=scale_ranges, 
             cache_device=cache_dev,
             force_no_cache=False,
             data_name = 'val'
@@ -486,28 +453,24 @@ def main():
 
     model = RMDetector(reg_max=reg_max).to(device)
     
-    # ---------------- 权重加载逻辑修改开始 ----------------
     if continue_cfg['enabled']:
         weight_path = Path(continue_cfg['path'])
         if weight_path.exists():
             model.load_state_dict(torch.load(weight_path))
             console.print(f"[bold green]成功加载历史权重：{weight_path}，继续训练。[/bold green]")
         else:
-            # 捕获文件为空/不存在的情况，自动回退到重新开始训练
             console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
             continue_cfg['enabled'] = False
-    # ---------------- 权重加载逻辑修改结束 ----------------
 
+    # 移除了 lambda_conf 和 lambda_box 的传入
     criterion = RMDetLoss(
-        loss_cfg['lambda_conf'], 
-        loss_cfg['lambda_box'], 
-        loss_cfg['lambda_pose'],
-        loss_cfg['lambda_cls'],
-        loss_cfg['alpha'],
-        loss_cfg['gamma'],
-        reg_max,
-        loss_cfg['omega'],
-        loss_cfg['epsilon']
+        lambda_pose=loss_cfg.get('lambda_pose', 1.5),
+        lambda_cls=loss_cfg.get('lambda_cls', 1.0),
+        alpha=loss_cfg.get('alpha', 0.85),
+        gamma=loss_cfg.get('gamma', 2.0),
+        reg_max=reg_max,
+        omega=loss_cfg.get('omega', 10.0),
+        epsilon=loss_cfg.get('epsilon', 2.0)
     ).to(device)
     
     optim_cfg = train_cfg['optimizer']
@@ -528,7 +491,7 @@ def main():
         eta_min=1e-6     
     )
 
-    best_val_score = 0.0 # 以前是 best_val_pck      
+    best_val_score = 0.0     
 
     console.print("[bold green]开始训练...[/bold green]")
     
@@ -544,7 +507,6 @@ def main():
         
         for epoch in range(1, epochs + 1):
             
-            # 接收带有分类/分项Loss的字典
             epoch_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
             val_loss, val_pck, val_id_acc = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg)
             
@@ -556,13 +518,9 @@ def main():
                 scheduler.step()
                 current_lr = optimizer.param_groups[0]['lr']
 
-            # --- 新增：计算综合得分 ---
             val_score = (w_pck * val_pck) + (w_id * val_id_acc)
 
-            # 更新至历史记录字典中
             history['train_total'].append(epoch_losses['total_loss'])
-            history['train_conf'].append(epoch_losses['loss_conf'])
-            history['train_box'].append(epoch_losses['loss_box'])
             history['train_pose'].append(epoch_losses['loss_pose'])
             history['train_cls'].append(epoch_losses['loss_cls'])
             
@@ -571,12 +529,9 @@ def main():
             history['val_score'].append(val_score)
             history['lr'].append(current_lr)
             
-            # 分两行打印：第一行打印所有的 loss，第二行打印验证集指标和学习率
             console.print(
                 f"[bold cyan]Epoch {epoch}/{epochs}[/bold cyan] | "
                 f"Train Total: {epoch_losses['total_loss']:.4f} | "
-                f"Conf: {epoch_losses['loss_conf']:.4f} | "
-                f"Box: {epoch_losses['loss_box']:.4f} | "
                 f"Pose: {epoch_losses['loss_pose']:.4f} | "
                 f"Cls: {epoch_losses['loss_cls']:.4f}"
             )
@@ -587,7 +542,6 @@ def main():
                 f"Val Score: {val_score:.4f}"
             )
             
-            # 依据综合得分决定是否保存最优模型
             if val_score > best_val_score:
                 best_val_score = val_score
                 torch.save(model.state_dict(), save_dir / "best_model.pth")
@@ -595,23 +549,20 @@ def main():
             
             progress.update(epoch_task, advance=1)
             
-            # 依据综合得分判定是否停止
             if auto_stop_enabled and val_score >= min_score:
                 console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                 break
 
         torch.save(model.state_dict(), save_dir / "last_model.pth")
         
-        # 分离保存多张曲线图片
         save_training_curves(history, save_dir)
         
-        # 更新日志写入逻辑，将多项损失分别打表记录
         log_file = save_dir / "train_log.txt"
         with log_file.open("w", encoding="utf-8") as f:
-            f.write("Epoch\tLR\tTotal_Loss\tConf_Loss\tBox_Loss\tPose_Loss\tCls_Loss\tVal_PCK\n")
+            f.write("Epoch\tLR\tTotal_Loss\tPose_Loss\tCls_Loss\tVal_PCK\n")
             for i in range(len(history['val_pck'])):
-                f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train_total'][i]:.6f}\t{history['train_conf'][i]:.6f}\t"
-                        f"{history['train_box'][i]:.6f}\t{history['train_pose'][i]:.6f}\t{history['train_cls'][i]:.6f}\t{history['val_pck'][i]:.6f}\n")
+                f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train_total'][i]:.6f}\t"
+                        f"{history['train_pose'][i]:.6f}\t{history['train_cls'][i]:.6f}\t{history['val_pck'][i]:.6f}\n")
                 
         del train_loader
         del val_loader

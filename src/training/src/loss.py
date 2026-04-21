@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import complete_box_iou_loss
 import math
 
 class WingLoss(nn.Module):
@@ -78,96 +77,59 @@ class Integral(nn.Module):
         return continuous_val
 
 class RMDetLoss(nn.Module):
-    def __init__(self, lambda_conf=1.0, lambda_box=2.0, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0):
+    def __init__(self, lambda_pose=1.5, lambda_cls=1.0, alpha=0.85, gamma=2.0, reg_max=16, omega=10.0, epsilon=2.0, num_classes=12):
         super().__init__()
-        self.lambda_conf = lambda_conf
-        self.lambda_box = lambda_box
+        # 已彻底移除 lambda_conf 和 lambda_box
         self.lambda_pose = lambda_pose 
         self.lambda_cls = lambda_cls
         self.reg_max = reg_max
+        self.num_classes = num_classes
         
         self.focal_loss = FocalLoss(alpha, gamma, reduction='sum')
         self.dfl = DFL()
         self.integral = Integral(reg_max)
-        self.wing_loss = WingLoss(omega=omega, epsilon=epsilon) # 替换了原来的 SmoothL1Loss
+        self.wing_loss = WingLoss(omega=omega, epsilon=epsilon) 
 
-    def _decode_pred_boxes(self, boxes, grid_y, grid_x, grid_w, grid_h):
-        # 中心点偏移保持不变：[-0.5, 1.5] 的平移范围
-        tx = torch.sigmoid(boxes[:, 0]) * 2.0 - 0.5
-        ty = torch.sigmoid(boxes[:, 1]) * 2.0 - 0.5
+    def compute_single_scale_loss(self, pred, target, target_class, global_num_pos): 
+        # pred shape: [B, num_classes + 8*reg_max, H, W]
         
-        # 【修改点】：将绝对尺寸预测改为相对于当前网格 (感受野) 的相对尺寸
-        # 限制最大缩放倍数为当前网格边长的 4 倍
-        w = (torch.sigmoid(boxes[:, 2]) * 2.0) ** 2 / grid_w
-        h = (torch.sigmoid(boxes[:, 3]) * 2.0) ** 2 / grid_h
+        # 1. 提取分类通道 (同时承担正负样本判别任务)
+        pred_cls = pred[:, :self.num_classes, :, :]
         
-        cx = (tx + grid_x) / grid_w
-        cy = (ty + grid_y) / grid_h
-        
-        x1 = cx - w / 2
-        y1 = cy - h / 2
-        x2 = cx + w / 2
-        y2 = cy + h / 2
-        
-        return torch.stack([x1, y1, x2, y2], dim=-1)
-
-    def _decode_target_boxes(self, boxes, grid_y, grid_x, grid_w, grid_h):
-        tx, ty = boxes[:, 0], boxes[:, 1]
-        w = torch.clamp(boxes[:, 2], min=1e-5)
-        h = torch.clamp(boxes[:, 3], min=1e-5)
-        
-        cx = (tx + grid_x) / grid_w
-        cy = (ty + grid_y) / grid_h
-        
-        x1 = cx - w / 2
-        y1 = cy - h / 2
-        x2 = cx + w / 2
-        y2 = cy + h / 2
-        
-        return torch.stack([x1, y1, x2, y2], dim=-1)
-
-    def compute_single_scale_loss(self, pred, target, target_class, global_num_pos): # 新增参数 global_num_pos
-        grid_h, grid_w = pred.shape[2], pred.shape[3]
-        
-        pred_conf = pred[:, 0, :, :]
+        # target_conf 依然用于指示该网格是否有目标 (1.0 为有，0.0 为背景)
         target_conf = target[:, 0, :, :]
-        
-        loss_conf_sum = self.focal_loss(pred_conf, target_conf)
         pos_mask = (target_conf == 1.0)
         
+        # 构建 one-hot 格式的分类 target
+        target_cls_onehot = torch.zeros_like(pred_cls)
+        target_class_long = target_class[:, 0:1, :, :].long()
+        # 将对应类别的通道置为 1.0
+        target_cls_onehot.scatter_(1, target_class_long, 1.0)
+        # 将非正样本的网格全部置为 0.0 (背景)
+        target_cls_onehot = target_cls_onehot * pos_mask.unsqueeze(1).float()
+        
+        # 计算全局分类损失 (包含正负样本)
+        loss_cls_sum = self.focal_loss(pred_cls, target_cls_onehot)
         # 【关键修复】：使用全局正样本数量进行归一化
-        loss_conf = loss_conf_sum / global_num_pos
+        loss_cls = loss_cls_sum / global_num_pos
 
         if not pos_mask.any():
-            return loss_conf * self.lambda_conf, {
-                'loss_conf': loss_conf.item(),
-                'loss_box': 0.0,
+            return loss_cls * self.lambda_cls, {
                 'loss_pose': 0.0,
-                'loss_cls': 0.0,
-                'total_loss': (loss_conf * self.lambda_conf).item()
+                'loss_cls': loss_cls.item(),
+                'total_loss': (loss_cls * self.lambda_cls).item()
             }
         
-        indices = torch.nonzero(pos_mask)
-        grid_y = indices[:, 1]  
-        grid_x = indices[:, 2]  
-
-        # 2. 边界框损失 (改为 sum 并全局归一化)
-        pred_boxes_raw = pred[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
-        target_boxes_raw = target[:, 1:5, :, :].permute(0, 2, 3, 1)[pos_mask]
-
-        pred_boxes = self._decode_pred_boxes(pred_boxes_raw, grid_y, grid_x, grid_w, grid_h)
-        target_boxes = self._decode_target_boxes(target_boxes_raw, grid_y, grid_x, grid_w, grid_h)
-        
-        loss_box_sum = complete_box_iou_loss(pred_boxes, target_boxes, reduction='sum')
-        loss_box = loss_box_sum / global_num_pos
-
-        # 3. 关键点损失 (DFL + L1 + OKS + Structural)
-        pose_start_idx = 5
-        pose_end_idx = 5 + 8 * self.reg_max
+        # 2. 关键点损失 (DFL + L1 + OKS + Structural)
+        pose_start_idx = self.num_classes
+        pose_end_idx = self.num_classes + 8 * self.reg_max
         
         pred_pose_raw = pred[:, pose_start_idx:pose_end_idx, :, :].permute(0, 2, 3, 1)[pos_mask]
         pred_pose_dist = pred_pose_raw.view(-1, 8, self.reg_max) 
-        target_pose = target[:, 5:13, :, :].permute(0, 2, 3, 1)[pos_mask]
+        
+        # 【注意】：假设 datasets.py 的 target_vector 已经去除了 4 维 box，精简为 9 维 (1 conf + 8 pose)
+        # 因此，这里的坐标切片从 5:13 改为 1:9
+        target_pose = target[:, 1:9, :, :].permute(0, 2, 3, 1)[pos_mask]
         
         target_pose_shifted = target_pose + (self.reg_max // 2)
         target_pose_shifted = torch.clamp(target_pose_shifted, 0, self.reg_max - 1.01)
@@ -199,9 +161,12 @@ class RMDetLoss(nn.Module):
         loss_struct = loss_struct_sum / (global_num_pos * 4)  # 2个中点各2个坐标维度
         # ----------------------------------------------------
 
-        w_norm = target[:, 3, :, :][pos_mask]
-        h_norm = target[:, 4, :, :][pos_mask]
-        scale = (w_norm * grid_w) * (h_norm * grid_h) + 1e-6
+        # 直接通过真实的 4 个关键点计算当前尺度下的包围框宽和高
+        w_grid = target_pts[:, :, 0].max(dim=1)[0] - target_pts[:, :, 0].min(dim=1)[0]
+        h_grid = target_pts[:, :, 1].max(dim=1)[0] - target_pts[:, :, 1].min(dim=1)[0]
+        
+        # 计算尺度因子 scale 用于 OKS
+        scale = w_grid * h_grid + 1e-6
         
         dists_sq = ((pred_pose_continuous - target_pose) ** 2).view(-1, 4, 2).sum(dim=-1)
         oks = torch.exp(-dists_sq / (2 * scale.unsqueeze(1) * 0.05))
@@ -213,22 +178,12 @@ class RMDetLoss(nn.Module):
         # 将 Structural Loss 加入总 Pose Loss（给与 0.2 的适中权重，不破坏原有梯度的平稳性）
         loss_pose = loss_pose_dfl + loss_pose_l1 + loss_oks * 0.5 + loss_struct * 0.2
 
-        # 4. 分类损失 (改为 sum 并全局归一化)
-        pred_cls = pred[:, pose_end_idx : pose_end_idx + 12, :, :].permute(0, 2, 3, 1)[pos_mask]
-        target_cls = target_class[:, 0, :, :][pos_mask] 
-        loss_cls_sum = nn.CrossEntropyLoss(reduction='sum')(pred_cls, target_cls)
-        loss_cls = loss_cls_sum / global_num_pos
-
         total_loss = (
-            self.lambda_conf * loss_conf + 
-            self.lambda_box * loss_box + 
-            self.lambda_pose * loss_pose +
-            self.lambda_cls * loss_cls
+            self.lambda_cls * loss_cls +
+            self.lambda_pose * loss_pose
         )
 
         loss_dict = {
-            'loss_conf': loss_conf.item(),
-            'loss_box': loss_box.item(),
             'loss_pose': loss_pose.item(),
             'loss_cls': loss_cls.item(),
             'total_loss': total_loss.item()
@@ -239,8 +194,6 @@ class RMDetLoss(nn.Module):
     def forward(self, preds, targets, target_classes):
         total_loss = 0.0
         combined_loss_dict = {
-            'loss_conf': 0.0, 
-            'loss_box': 0.0, 
             'loss_pose': 0.0, 
             'loss_cls': 0.0, 
             'total_loss': 0.0

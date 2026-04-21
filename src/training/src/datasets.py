@@ -22,14 +22,12 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
     """
     kpts = np.array(label_data[2:]).reshape(4, 2)
     
+    # 仅使用关键点计算中心坐标，用于决定分配给哪个网格
     x_min, y_min = np.min(kpts, axis=0)
     x_max, y_max = np.max(kpts, axis=0)
-    
     cx, cy = (x_min + x_max) / 2.0, (y_min + y_max) / 2.0
-    w, h = x_max - x_min, y_max - y_min
     
     cx_norm, cy_norm = cx / img_w, cy / img_h
-    w_norm, h_norm = w / img_w, h / img_h
     kpts_norm = kpts / np.array([img_w, img_h])
     
     # 获取浮点网格坐标
@@ -61,24 +59,20 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
     
     # 为每一个候选网格重新计算相对偏移量
     for (cg_x, cg_y) in candidates:
-        t_x = grid_x_float - cg_x
-        t_y = grid_y_float - cg_y
-        
         # 关键点基于当前分配网格的偏移
         kpts_grid_offset = kpts_norm * np.array([grid_w, grid_h]) - np.array([cg_x, cg_y])
         kpts_offset_flat = kpts_grid_offset.flatten()
         
-        target_vector = np.zeros(13, dtype=np.float32)
-        target_vector[0] = 1.0  # 正样本置信度
-        target_vector[1:5] = [t_x, t_y, w_norm, h_norm]
-        target_vector[5:13] = kpts_offset_flat
+        # --- 核心修改：缩减至 9 维 (1 表示有目标 + 8 维关键点坐标) ---
+        target_vector = np.zeros(9, dtype=np.float32)
+        target_vector[0] = 1.0  # 正样本置信度标识
+        target_vector[1:9] = kpts_offset_flat
         
         results.append((target_vector, cg_x, cg_y, class_id))
         
     return results
 
 class RMArmorDataset(Dataset):
-    # 修改了初始化参数，将 grid_size 替换为 strides 列表以支持多尺度
     def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, cache_device=None, force_no_cache=False, data_name = ''):
         self.img_dir = img_dir
         self.label_dir = label_dir
@@ -137,7 +131,8 @@ class RMArmorDataset(Dataset):
         target_tensors = []
         class_tensors = []
         for gw, gh in self.grid_sizes:
-            target_tensors.append(np.zeros((13, gh, gw), dtype=np.float32))
+            # --- 核心修改：初始化通道数改为 9 ---
+            target_tensors.append(np.zeros((9, gh, gw), dtype=np.float32))
             class_tensors.append(np.zeros((1, gh, gw), dtype=np.int64))
 
         # 4. 读取标签并遍历所有目标

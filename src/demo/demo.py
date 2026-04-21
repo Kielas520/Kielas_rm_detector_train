@@ -7,9 +7,8 @@ from rich.console import Console
 from rich.status import Status
 from rich.panel import Panel
 from rich import print as rprint
-import torchvision
 
-# 1. 导入模型组件 (新增导入 keypoint_nms)
+# 1. 导入模型组件
 from src.training.src.model import RMDetector, decode_tensor, keypoint_nms
 
 # 2. 导入海康相机
@@ -24,6 +23,10 @@ class InferenceEngine:
         rprint(f"已加载到 {self.device}")
         self.model_path = Path(cfg['model_path'])
         
+        # 获取核心参数，适配精简后的网络
+        self.reg_max = cfg.get('reg_max', 16)
+        self.num_classes = cfg.get('num_classes', 12)
+        
         if not self.model_path.exists():
             raise FileNotFoundError(f"找不到模型文件: {self.model_path.absolute()}")
 
@@ -34,7 +37,8 @@ class InferenceEngine:
                 self.session = ort.InferenceSession(str(self.model_path), providers=providers)
                 self.input_name = self.session.get_inputs()[0].name
             elif self.type == "pytorch":
-                self.model = RMDetector().to(self.device)
+                # 完全同步重构后的初始化参数
+                self.model = RMDetector(reg_max=self.reg_max, num_classes=self.num_classes).to(self.device)
                 self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
                 self.model.eval()
             elif self.type == "torchscript":
@@ -50,7 +54,7 @@ class InferenceEngine:
             with torch.no_grad():
                 return self.model(x_tensor)
 
-def process_multi_scale_preds(preds, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh):
+def process_multi_scale_preds(preds, strides, input_size, reg_max, conf_thresh, kpt_dist_thresh, num_classes):
     """处理多尺度预测列表，并执行跨尺度关键点 NMS"""
     if not isinstance(preds, list):
         preds = [preds]
@@ -61,9 +65,14 @@ def process_multi_scale_preds(preds, strides, input_size, reg_max, conf_thresh, 
     for i, s in enumerate(strides):
         current_grid = (input_size[0] // s, input_size[1] // s)
         pred_scale = decode_tensor(
-            preds[i], is_pred=True, conf_threshold=conf_thresh, 
-            kpt_dist_thresh=kpt_dist_thresh, grid_size=current_grid, 
-            reg_max=reg_max, img_size=input_size
+            preds[i], 
+            is_pred=True, 
+            conf_threshold=conf_thresh, 
+            kpt_dist_thresh=kpt_dist_thresh, 
+            grid_size=current_grid, 
+            reg_max=reg_max, 
+            img_size=input_size,
+            num_classes=num_classes # 传入正确分类数
         )
         
         for b in range(batch_size):
@@ -92,6 +101,7 @@ def draw_and_extract(frame, dets, orig_shape, input_size):
     info_list = []
 
     for det in dets:
+        # det 结构: [score, cls_id, px1, py1, px2, py2, px3, py3, px4, py4]
         score, cls_id = det[0], int(det[1])
         pts = det[2:].reshape(4, 2)
         pts[:, 0] *= scale_x
@@ -123,6 +133,7 @@ def main():
     input_sz = tuple(cfg['input_size'])
     strides = cfg.get('strides', [8, 16, 32])
     reg_max = cfg.get('reg_max', 16)
+    num_classes = cfg.get('num_classes', 12)
     
     conf_t = cfg['conf_threshold']
     kpt_dist_t = cfg.get('kpt_dist_thresh', 15.0)
@@ -172,7 +183,8 @@ def main():
                 input_size=input_sz, 
                 reg_max=reg_max,
                 conf_thresh=conf_t, 
-                kpt_dist_thresh=kpt_dist_t
+                kpt_dist_thresh=kpt_dist_t,
+                num_classes=num_classes
             )
             
             fps = cv2.getTickFrequency() / (cv2.getTickCount() - st)
