@@ -6,7 +6,7 @@ import cv2
 import torchvision 
 import multiprocessing
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-
+import time
 # =========================================================================
 # 【系统级优化】
 # 强制关闭 OpenCV 内部多线程与 OpenCL。
@@ -58,61 +58,69 @@ def save_training_curves(history, save_dir):
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
 
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage):
-    """
-    单轮训练逻辑
-    :param current_stage: 接收外部传入的“当前洗牌阶段”，用于显示在进度条上
-    """
+# 修改函数签名，接收计数器、batch_size 和数据集总大小
+def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples):
     model.train()
     
-    # 初始化记录各项 Loss 的字典
-    epoch_losses = {
-        'loss_pose': 0.0,
-        'loss_cls': 0.0,
-        'total_loss': 0.0
-    }
-    
-    # ✅ 修复：不使用 task.fields，直接将 Stage 拼接到描述字符串中
-    task_id = progress.add_task(
-        f"[cyan]Train Epoch {epoch} [bold magenta](Stage {current_stage})[/bold magenta]", 
-        total=len(dataloader)
-    )
+    epoch_losses = {'loss_pose': 0.0, 'loss_cls': 0.0, 'total_loss': 0.0}
+    task_id = progress.add_task(f"[cyan]Train Epoch {epoch} [bold magenta](Stage {current_stage})[/bold magenta]", total=len(dataloader))
 
+    # 计算理论最大缓存批次 (通常是 workers * prefetch_factor)
+    max_cache = (dataloader.num_workers * dataloader.prefetch_factor) if dataloader.num_workers > 0 else 0
+
+    fetch_start_time = time.time()
     for batch_idx, (imgs, targets, class_ids) in enumerate(dataloader):
+        # 记录 GPU 等待 CPU 数据花费的时间
+        data_time = time.time() - fetch_start_time
+        
         imgs = imgs.to(device)
         targets = [t.to(device) for t in targets]
         class_ids = [c.to(device) for c in class_ids]
         
         optimizer.zero_grad()
         
-        # 开启自动混合精度 (AMP)，极大加速运算并节省显存
         with torch.autocast(device_type=device.type, dtype=torch.float16):
             preds = model(imgs) 
             loss, loss_dict = criterion(preds, targets, class_ids)
             
-        # 梯度缩放器用于防止 float16 模式下的梯度下溢
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        
-        # 梯度裁剪，防止 Loss 爆炸
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0) 
-        
         scaler.step(optimizer)
         scaler.update()
         
         for k in epoch_losses:
             epoch_losses[k] += loss_dict[k]
             
-        # ✅ 动态更新时，也是直接刷新描述文字
+        # ================= 队列深度计算 =================
+        # 历史已消耗样本数 + 当前批次已消耗样本数
+        total_consumed = (epoch - 1) * total_samples + (batch_idx + 1) * batch_size
+        # CPU 实际生产的总样本数
+        with processed_counter.get_lock():
+            total_produced = processed_counter.value
+            
+        # 换算成批次：(生产数 - 消耗数) // batch_size
+        cached_batches = max(0, (total_produced - total_consumed) // batch_size)
+        
+        # 颜色告警：如果缓存归 0，说明发生阻塞，标红显示
+        cache_color = "red" if cached_batches == 0 else "green"
+            
         progress.update(
             task_id, 
             advance=1, 
-            description=f"[cyan]Epoch {epoch} [Stage {current_stage}] | Loss: {loss.item():.3f} | Cls: {loss_dict['loss_cls']:.3f}"
+            description=(
+                f"[cyan]Epoch {epoch} [Stage {current_stage}][/cyan] | "
+                f"[{cache_color}]CPU缓存: {cached_batches}/{max_cache}批[/{cache_color}] | "
+                f"等待数据: {data_time:.2f}s | "
+                f"Loss: {loss.item():.3f}"
+            )
         )
+        
+        # 重置时间，开始记录下一个批次的获取耗时
+        fetch_start_time = time.time()
         
     progress.remove_task(task_id)
     
-    # 计算全 Epoch 平均 Loss
     num_batches = len(dataloader)
     for k in epoch_losses:
         epoch_losses[k] /= num_batches
@@ -446,7 +454,7 @@ def main():
     
     # ✅ 创建多进程安全共享变量：充当洗牌时钟
     shared_stage = multiprocessing.Value('i', 0)
-    
+    processed_counter = multiprocessing.Value('i', 0) # <-- 新增：用于记录 CPU 已处理样本总数
     console.print(f"[bold cyan]准备数据集 (多进程 Worker={workers})...[/bold cyan]")
 
     # 训练集：挂载增强引擎、背景库、洗牌时钟
@@ -461,7 +469,8 @@ def main():
             data_name='train',
             augment_cfg=aug_cfg,          
             bg_dir=bg_dir_str,           # <-- 改为直接传路径字符串
-            shared_stage=shared_stage     
+            shared_stage=shared_stage,
+            processed_counter=processed_counter # <-- 传给 Dataset     
         ),
         batch_size=train_cfg['batch_size'],
         shuffle=True,
@@ -588,7 +597,10 @@ def main():
             # 将 shared_stage.value 传进 train_one_epoch
             epoch_losses = train_one_epoch(
                 model, train_loader, optimizer, criterion, device, 
-                epoch, progress, scaler, shared_stage.value
+                epoch, progress, scaler, shared_stage.value,
+                processed_counter=processed_counter,            # <-- 新增
+                batch_size=train_cfg['batch_size'],             # <-- 新增
+                total_samples=len(train_loader.dataset)         # <-- 新增
             )
             
             val_loss, val_pck, val_id_acc = validate(

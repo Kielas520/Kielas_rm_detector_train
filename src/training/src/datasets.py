@@ -84,7 +84,7 @@ def encode_multi_targets(label_data, img_w=416, img_h=416, grid_w=52, grid_h=52)
 class RMArmorDataset(Dataset):
     def __init__(self, img_dir, label_dir, class_id, input_size=(416, 416), strides=[8, 16, 32], 
                  scale_ranges=[[0, 64], [32, 128], [96, 9999]], transform=None, data_name='', 
-                 augment_cfg=None, bg_dir=None, shared_stage=None): # <-- 改为 bg_dir
+                 augment_cfg=None, bg_dir=None, shared_stage=None, processed_counter=None): # <-- 改为 bg_dir
         
         self.img_dir = img_dir
         self.label_dir = label_dir
@@ -99,7 +99,7 @@ class RMArmorDataset(Dataset):
         
         self.samples = [f.split('.')[0] for f in os.listdir(label_dir) if f.endswith('.txt')]
         self.shared_stage = shared_stage
-        # self.processed_counter = processed_counter # <-- 接收跨进程计数器
+        self.processed_counter = processed_counter # <-- 接收跨进程计数器
         self.augment_cfg = augment_cfg
         
         # 仅保存目录路径，不提前搬运数据
@@ -218,5 +218,10 @@ class RMArmorDataset(Dataset):
         img_tensor = torch.from_numpy(img_resized.transpose(2, 0, 1)).float() / 255.0
         target_tensors = [torch.from_numpy(t) for t in target_tensors]
         class_tensors = [torch.from_numpy(c) for c in class_tensors]
-        
+        # ================= 在 return 之前新增以下逻辑 =================
+        # 每次 Worker 处理完一张图，跨进程计数器 +1
+        if self.processed_counter is not None:
+            with self.processed_counter.get_lock():
+                self.processed_counter.value += 1
+                
         return img_tensor, target_tensors, class_tensors
