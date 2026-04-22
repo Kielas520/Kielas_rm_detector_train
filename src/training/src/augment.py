@@ -77,10 +77,9 @@ def get_expanded_roi(pts, h_exp, w_exp):
     return np.array([p0_new, p1_new, p3_new, p2_new], dtype=np.int32)
 
 def generate_composite_bg(bg_paths, w, h):
-    """生成复合背景，如果找不到真实的背景图，生成强对比度网格以供调试"""
+    """生成复合背景，通过路径动态读取（操作系统会自动处理底层内存缓存）"""
     if not bg_paths: 
         # === 兜底调试背景生成器 ===
-        # 如果没有背景图，生成一个紫绿相间的网格，让你一眼看出哪里被抠掉了、哪里是遮挡的洞
         bg = np.zeros((h, w, 3), dtype=np.uint8)
         grid_size = max(w, h) // 15
         for y in range(0, h, grid_size):
@@ -92,14 +91,17 @@ def generate_composite_bg(bg_paths, w, h):
         noise = np.random.randint(0, 50, (h, w, 3), dtype=np.uint8)
         return cv2.add(bg, noise)
 
-    # 正常的随机背景堆叠逻辑
-    bg = cv2.imread(str(random.choice(bg_paths)))
-    if bg is None: return np.zeros((h, w, 3), dtype=np.uint8)
+    # 正常的随机背景堆叠逻辑 (通过路径读取，避免多进程内存爆炸)
+    bg_path = str(random.choice(bg_paths))
+    bg = cv2.imread(bg_path)
+    if bg is None: # 兜底防止坏图
+        bg = np.zeros((h, w, 3), dtype=np.uint8)
     bg = cv2.resize(bg, (w, h))
 
     if random.random() < 0.6:
         for _ in range(random.randint(1, 2)):
-            patch = cv2.imread(str(random.choice(bg_paths)))
+            patch_path = str(random.choice(bg_paths))
+            patch = cv2.imread(patch_path)
             if patch is None: continue
             pw, ph = random.randint(int(w*0.3), int(w*0.7)), random.randint(int(h*0.3), int(h*0.7))
             patch = cv2.resize(patch, (pw, ph))
@@ -112,6 +114,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
     aug_labels = copy.deepcopy(labels)
     h_orig, w_orig = aug_img.shape[:2]
     
+    # 恢复使用 bg_paths
     bg_img = generate_composite_bg(bg_paths, w_orig, h_orig)
 
     # ================= 1. 基础光学增强 =================
@@ -384,6 +387,7 @@ if __name__ == "__main__":
     bg_dir = Path(cfg.bg_dir)
     bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
     
+    # 删除了测试环境的提前读入逻辑，恢复传背景图路径列表
     if not bg_paths:
         print("⚠️  警告：未找到背景图片！已自动启用紫绿网格作为测试替代背景。")
 
@@ -424,6 +428,7 @@ if __name__ == "__main__":
             labels = parse_labels_for_test(label_path)
             
         for v in range(30):
+            # ✅ 这里恢复传入 bg_paths
             aug_img, aug_lbls = process_data(img, labels, cfg, bg_paths)
             viz_img = aug_img.copy()
             for lbl in aug_lbls:

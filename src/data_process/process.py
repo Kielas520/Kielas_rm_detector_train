@@ -92,19 +92,6 @@ def run_split_step(config):
         num_workers=8
     )
 
-def run_augment_step(config):
-    datasets_dir = get_path(config, 'datasets_dir', "./data/datasets")
-    if not check_dir(datasets_dir, must_exist=True): return
-
-    console.print(Panel(f"开始执行 Augment (数据增强 - 仅针对训练集)\n目标路径: {datasets_dir}", style="cyan"))
-    # 恢复执行函数
-    aug_cfg = AugmentConfig.from_yaml("config.yaml")
-    run_augment_pipeline(
-        dataset_dir=str(datasets_dir), 
-        num_workers=8,
-        cfg=aug_cfg
-    )
-
 def run_visualize_step(stage: str, if_flag: list):
     root_path = Path("./data")
     console.print(Panel(f"开始执行 Visualize (对 {stage} 阶段抽样可视化)", style="magenta"))
@@ -126,8 +113,6 @@ def run_full_pipeline(config):
     run_visualize_step("balance", if_flag=[0, 0])
     
     run_split_step(config)
-    
-    run_augment_step(config)
     
     run_visualize_step("datasets", if_flag=[1, 1])
     
@@ -163,15 +148,14 @@ def main():
         "  [bold green]2[/bold green]. 仅执行 [bold]Purify[/bold] (清洗)\n"
         "  [bold green]3[/bold green]. 仅执行 [bold]Balance[/bold] (均衡)\n"
         "  [bold green]4[/bold green]. 仅执行 [bold]Split[/bold] (拆分)\n"
-        "  [bold green]5[/bold green]. 仅执行 [bold]Augment[/bold] (增强训练集)\n"
-        "  [bold green]6[/bold green]. 执行 [bold]Visualize[/bold] (可视化特定阶段)\n"
+        "  [bold green]5[/bold green]. 执行 [bold]Visualize[/bold] (可视化特定阶段)\n"
         "  [bold red]0[/bold red]. 退出程序"
     )
     
     console.print(Panel.fit(menu_text, border_style="cyan"))
 
     while True:
-        choice = Prompt.ask("\n请选择操作序号", choices=["1", "2", "3", "4", "5", "6", "0"], default="1")
+        choice = Prompt.ask("\n请选择操作序号", choices=["1", "2", "3", "4", "5", "0"], default="1")
 
         if choice == '0':
             console.print("[yellow]已退出。[/yellow]")
@@ -188,11 +172,8 @@ def main():
             
         elif choice == '4':
             run_split_step(config)
-            
-        elif choice == '5':
-            run_augment_step(config)
 
-        elif choice == '6':
+        elif choice == '5':
             interactive_visualize()
 
 if __name__ == "__main__":

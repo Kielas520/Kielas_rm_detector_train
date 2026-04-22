@@ -50,7 +50,8 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 128
-    epochs: 100
+    prefetch_factor: 8
+    epochs: 10
     weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -60,9 +61,8 @@ kielas_rm_train:
     continue:
       path: "./model_res/best_model.pth"
 
-    cache_loader:
-      load: true
-      device: 'cpu'
+    # --- 新增：半在线洗牌频率 ---
+    shuffle_interval: 5  # 每 5 轮重新随机生成一次不同的增强数据
     
     optimizer:
       base_lr: 0.0002
@@ -86,7 +86,7 @@ kielas_rm_train:
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 0 # 数据搬运到cpu了，你开多线程纯有病
+      num_workers: 8
       # 对应 stride [8, 16, 32]
       # Stride 8  负责 0-64 像素 (远)
       # Stride 16 负责 48-128 像素 (中)

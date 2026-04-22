@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import cv2
 import torchvision 
-# 导入
+import multiprocessing
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # 强制关闭 OpenCV 内部多线程与 OpenCL，防止多进程数据加载时 CPU 和内存跑满
@@ -332,22 +332,22 @@ def main():
         return
 
     with open(config_file, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)['kielas_rm_train']
+        cfg_data = yaml.safe_load(f)
+        cfg = cfg_data['kielas_rm_train']
     
     train_cfg = cfg['train']
-    loss_cfg = cfg['train']['loss']
-    pck_cfg = cfg['train']['pck']
-    data_cfg = cfg['train']['data']
-    post_cfg = cfg['train']['post_process']
-    cache_loader = cfg['train']['cache_loader']
-    continue_cfg = cfg['train']['continue']
+    loss_cfg = train_cfg['loss']
+    pck_cfg = train_cfg['pck']
+    data_cfg = train_cfg['data']
+    post_cfg = train_cfg['post_process']
+    continue_cfg = train_cfg['continue']
     go_on = False
+    
+    # 提取半在线洗牌的时钟周期，默认 5 轮洗牌一次
+    shuffle_interval = train_cfg.get('shuffle_interval', 5)
     
     conf_thresh = float(post_cfg.get('conf_threshold', 0.5))
     kpt_dist_thresh = float(post_cfg.get('kpt_dist_thresh', 15.0))
-
-    cache_load = cache_loader.get('load', False)
-    cache_load_device = cache_loader.get('device', 'cpu')
 
     metric_weights = train_cfg.get('metric_weights', {'pck': 0.6, 'id_acc': 0.4})
     w_pck = float(metric_weights.get('pck', 0.6))
@@ -404,17 +404,24 @@ def main():
     strides = train_cfg.get('strides', [8, 16, 32])
     reg_max = int(train_cfg.get('reg_max', 16)) 
 
-    if cache_load:
-        cache_dev = torch.device(cache_load_device)
-    else:
-        cache_dev = None
-
-    scaler = torch.amp.GradScaler(device.type) # type: ignore
+    scaler = torch.amp.GradScaler(device.type)
     
     workers = data_cfg['num_workers'] 
     pin_mem = True if device.type == 'cuda' else False
+
+    # ---------------- 增强环境初始化 ----------------
+    console.print(f"[bold cyan]正在初始化半在线数据增强环境...[/bold cyan]")
     
-    console.print(f"[bold cyan]正在准备数据集 (动态加载模式, workers={workers})...[/bold cyan]")
+    aug_cfg_dict = cfg['dataset']['augment']
+    aug_cfg = AugmentConfig(**aug_cfg_dict)
+    
+    bg_dir = Path(aug_cfg_dict.get('bg_dir', './background'))
+    bg_paths = list(bg_dir.glob("*.jpg")) + list(bg_dir.glob("*.png")) if bg_dir.exists() else []
+    
+    # 初始化多进程共享的阶段变量，用于控制子进程同步洗牌
+    shared_stage = multiprocessing.Value('i', 0)
+    
+    console.print(f"[bold cyan]准备数据集 (多进程 Worker={workers})...[/bold cyan]")
 
     train_loader = DataLoader(
         RMArmorDataset(
@@ -424,15 +431,18 @@ def main():
             input_size=input_size, 
             strides=strides,
             scale_ranges=scale_ranges, 
-            cache_device=cache_dev,
-            force_no_cache=False,
-            data_name = 'train'          
+            data_name='train',
+            augment_cfg=aug_cfg,          # 注入增强配置
+            bg_paths=bg_paths,            # 注入背景库
+            shared_stage=shared_stage     # 注入同步洗牌时钟
         ),
-        batch_size=train_cfg['batch_size'], 
-        shuffle=True, 
+        batch_size=train_cfg['batch_size'],
+        shuffle=True,
         num_workers=workers,
         pin_memory=pin_mem,
-        persistent_workers=True if workers > 0 else False
+        persistent_workers=True if workers > 0 else False,
+        # 👇 新增这一行：让每个 worker 在后台提前准备 4 到 8 个 batch
+        prefetch_factor=train_cfg['prefetch_factor'] if workers > 0 else None
     )
     
     val_loader = DataLoader(
@@ -443,9 +453,8 @@ def main():
             input_size=input_size, 
             strides=strides,
             scale_ranges=scale_ranges, 
-            cache_device=cache_dev,
-            force_no_cache=False,
-            data_name = 'val'
+            data_name='val'
+            # 验证集不传入 aug_cfg 和 shared_stage，保持绝对的静态测试环境
         ),
         batch_size=train_cfg['batch_size'], 
         shuffle=False, 
@@ -465,10 +474,7 @@ def main():
             console.print(f"[bold yellow]警告：指定的历史权重文件 {weight_path} 不存在（可能是新文件夹或已被清除），将自动从头开始训练。[/bold yellow]")
             go_on = False
 
-    # ---------------- 新增：解析 dataset.yaml 获取权重 ----------------
-    # 按照 YOLO 数据集规范，基于 train_img_dir 自动定位 dataset.yaml
-    # 假设 data_cfg['train_img_dir'] 为 ".../datasets/images/train"
-    # 向上退两级即可到达 ".../datasets" 目录
+    # 解析 dataset.yaml 获取多类别权重
     train_img_path = Path(data_cfg['train_img_dir'])
     dataset_yaml_path = train_img_path.parent.parent / "dataset.yaml"
     
@@ -479,19 +485,16 @@ def main():
             ds_cfg = yaml.safe_load(f)
             weights_dict = ds_cfg.get('weights', {})
             if weights_dict:
-                # 模型 num_classes 为 12，构建长度为 12 的默认权重数组
                 num_classes = 12 
                 weights_list = [1.0] * num_classes
                 for cls_idx, weight in weights_dict.items():
                     if int(cls_idx) < num_classes:
                         weights_list[int(cls_idx)] = float(weight)
                 
-                # 转换为 Tensor 并移动到对应设备
                 class_weights_tensor = torch.tensor(weights_list, dtype=torch.float32).to(device)
                 console.print(f"[bold green]已从 {dataset_yaml_path.name} 加载多类别权重: {weights_list}[/bold green]")
     else:
         console.print(f"[bold yellow]警告：未在 {dataset_yaml_path.parent} 下找到 dataset.yaml，将不使用类别加权。[/bold yellow]")
-    # -------------------------------------------------------------------
 
     criterion = RMDetLoss(
         lambda_pose=loss_cfg.get('lambda_pose', 1.5),
@@ -501,7 +504,7 @@ def main():
         reg_max=reg_max,
         omega=loss_cfg.get('omega', 10.0),
         epsilon=loss_cfg.get('epsilon', 2.0),
-        class_weights=class_weights_tensor  # 传入自动解析到的权重
+        class_weights=class_weights_tensor
     ).to(device)
     
     optim_cfg = train_cfg['optimizer']
@@ -517,11 +520,10 @@ def main():
     warmup_epochs = max(1, int(epochs * 0.05))
     scheduler_cfg = train_cfg['scheduler']
 
-    # 替换原有的 scheduler
     scheduler = CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=scheduler_cfg['T_0'],          # 第一次重启在第20个epoch
-        T_mult=scheduler_cfg['T_mult'],        # 后续重启周期翻倍 (20, 40, 80...)
+        T_0=scheduler_cfg['T_0'],
+        T_mult=scheduler_cfg['T_mult'],
         eta_min=1e-6
     )
 
@@ -540,6 +542,12 @@ def main():
         epoch_task = progress.add_task("[bold green]总体训练进度", total=epochs)
         
         for epoch in range(1, epochs + 1):
+            
+            # 触发洗牌时钟：跳过第一轮，后续按照设定的间隔轮数同步阶段
+            if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
+                with shared_stage.get_lock():
+                    shared_stage.value += 1
+                console.print(f"\n[bold yellow]🔄 触发半在线洗牌机制！目前进入增强数据批次 {shared_stage.value}[/bold yellow]")
             
             epoch_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, progress, scaler)
             val_loss, val_pck, val_id_acc = validate(model, val_loader, criterion, device, epoch, progress, input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg)
@@ -611,14 +619,14 @@ def main():
             console.print("[yellow]警告：未发现最佳模型文件，将使用最后一次迭代的权重进行可视化。[/yellow]")
             model.load_state_dict(torch.load(save_dir / "last_model.pth", weights_only=True))
         
+        # 可视化阶段全部保持无增强环境，直观评估原图表现
         vis_train_dataset = RMArmorDataset(
             data_cfg['train_img_dir'], 
             data_cfg['train_label_dir'],
             data_cfg['class_id'],
             input_size=input_size, 
             strides=strides, 
-            cache_device=cache_dev,
-            force_no_cache=True 
+            data_name='vis_train'
         )
         
         vis_val_dataset = RMArmorDataset(
@@ -627,8 +635,7 @@ def main():
             data_cfg['class_id'],
             input_size=input_size, 
             strides=strides, 
-            cache_device=cache_dev,
-            force_no_cache=True
+            data_name='vis_val'
         )
 
         vis_train_loader = DataLoader(
@@ -644,20 +651,32 @@ def main():
             num_workers=0
         )
         
-        # 注意：这里把原 train.py 中的 process_multi_scale_dets 作为参数传进去
-        visualize_predictions_with_features(
-            model, vis_train_loader, device, save_dir, prefix="train", 
-            progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
-            process_multi_scale_dets_fn=process_multi_scale_dets,  # <-- 传入解码函数
-            num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
-        )
-        
-        visualize_predictions_with_features(
-            model, vis_val_loader, device, save_dir, prefix="val", 
-            progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
-            process_multi_scale_dets_fn=process_multi_scale_dets,
-            num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
-        )
+        try:
+            visualize_predictions_with_features(
+                model, vis_train_loader, device, save_dir, prefix="train", 
+                progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
+                process_multi_scale_dets_fn=process_multi_scale_dets,
+                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+            )
+            
+            visualize_predictions_with_features(
+                model, vis_val_loader, device, save_dir, prefix="val", 
+                progress=progress, input_size=input_size, strides=strides, reg_max=reg_max, 
+                process_multi_scale_dets_fn=process_multi_scale_dets,
+                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+            )
+        except NameError:
+            # 向后兼容你之前代码中用到的函数名
+            visualize_predictions(
+                model, vis_train_loader, device, save_dir, prefix="train", 
+                progress=progress, input_size=input_size, strides=strides, reg_max=reg_max,
+                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+            )
+            visualize_predictions(
+                model, vis_val_loader, device, save_dir, prefix="val", 
+                progress=progress, input_size=input_size, strides=strides, reg_max=reg_max,
+                num_samples=5, conf_threshold=conf_thresh, kpt_dist_thresh=kpt_dist_thresh
+            )
 
     console.print(f"\n[bold green]训练与评估完成！所有结果已保存至: {save_dir.absolute()}[/bold green]")
 
