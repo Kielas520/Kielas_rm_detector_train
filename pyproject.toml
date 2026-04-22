@@ -31,7 +31,6 @@ dependencies = [
     # Linux
     "torch>=2.5.0; sys_platform == 'linux'",
     "torchvision>=0.19.0; sys_platform == 'linux'",
-    "regex>=2026.4.4",
 ]
 
 [tool.uv]
