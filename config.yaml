@@ -23,6 +23,8 @@ kielas_rm_train:
       # --- 几何变换增强 (终极形变模式) ---
       flip_prob: 0.5              # 彻底放开镜像，相当于数据量直接翻倍
       scale_prob: 0.9             # 配合你刚修复的 Scale 逻辑，疯狂折磨多尺度特征金字塔
+      roi_h_exp: 2.2
+      roi_w_exp: 1.1
       scale_range: [0.3, 2.5]     # 从芝麻大小(几十像素)到糊脸(占满半个屏幕)，让每个 Stride 的网格都被强制激活
       rotate_prob: 0.8            
       rotate_range: [-45, 45]     # 模拟飞坡、翻车、剧烈碰撞以及极端云台俯仰角带来的旋转

@@ -177,20 +177,18 @@ def process_data(img, labels, cfg, bg_paths: list = None):
         plate_area = max(cv2.contourArea(get_expanded_roi(primary_pts, 1.0, 1.0)), 1.0)
         cx, cy = np.mean(primary_pts, axis=0)
 
-        # --- 计算缩放 (彻底放开限制，允许糊脸) ---
         scale = 1.0
         if random.random() < cfg.scale_prob:
             target_area_ratio = random.uniform(*cfg.scale_range)
             target_area = w_orig * h_orig * target_area_ratio
             scale = np.sqrt(target_area / plate_area)
-            # 移除之前的极端安全锁，允许 2.5 倍贴脸放大
         
-        # --- 计算平移 (确保目标中心不出界即可) ---
         tx, ty = 0.0, 0.0
         if random.random() < cfg.translate_prob:
             dt_x, dt_y = cfg.translate_range * w_orig, cfg.translate_range * h_orig
             tx = random.uniform(-dt_x, dt_x)
             ty = random.uniform(-dt_y, dt_y)
+            # 初步约束中心点不飞得太离谱
             ncx, ncy = cx + tx, cy + ty
             ncx = np.clip(ncx, w_orig * 0.1, w_orig * 0.9)
             ncy = np.clip(ncy, h_orig * 0.1, h_orig * 0.9)
@@ -198,7 +196,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
 
         angle = random.uniform(*cfg.rotate_range) if random.random() < cfg.rotate_prob else 0.0
 
-        # --- 组装终极 3x3 变换矩阵 M_total ---
+        # --- 组装基础 3x3 变换矩阵 M_total ---
         T1 = np.eye(3, dtype=np.float32)
         T1[0, 2], T1[1, 2] = -cx, -cy
         
@@ -221,32 +219,84 @@ def process_data(img, labels, cfg, bg_paths: list = None):
                 [w_orig - random.uniform(0, margin), h_orig - random.uniform(0, margin)]
             ])
             M_persp = cv2.getPerspectiveTransform(pts1, pts2).astype(np.float32)
-            M_total = M_persp @ M_affine # 完美矩阵乘法叠加
+            M_total = M_persp @ M_affine 
 
-        # ================= 3. 一次性执行所有坐标映射 =================
-        aug_img = cv2.warpPerspective(aug_img, M_total, (w_orig, h_orig), borderValue=(0, 0, 0))
+        # ================= 3. 极速安全边界校验与数学修正 =================
+        # 预计算所有点经过变换后的物理坐标
+        all_pts = []
+        for lab in aug_labels:
+            pts = cv2.perspectiveTransform(np.array([lab['pts']], dtype=np.float32), M_total)[0]
+            all_pts.extend(pts)
+        all_pts = np.array(all_pts)
         
-        # 画面框架蒙版同步变化（用来兜底仿射变换产生的纯黑死角）
+        min_x, min_y = np.min(all_pts, axis=0)
+        max_x, max_y = np.max(all_pts, axis=0)
+        
+        # 定义安全内边距 (图像边长的 0.2 倍)
+        margin_x = w_orig * 0.2
+        margin_y = h_orig * 0.2
+        
+        # 检查是否任何一个点突破了安全警戒线
+        if min_x < margin_x or max_x > w_orig - margin_x or min_y < margin_y or max_y > h_orig - margin_y:
+            # 触发兜底机制：计算当前点阵的包围盒状态
+            cx_test = (min_x + max_x) / 2.0
+            cy_test = (min_y + max_y) / 2.0
+            bw_test = max_x - min_x
+            bh_test = max_y - min_y
+            
+            # 允许的最大安全尺寸
+            safe_w = w_orig - 2 * margin_x
+            safe_h = h_orig - 2 * margin_y
+            
+            # 计算将包围盒压回安全尺寸所需的精准缩放倍率
+            corr_scale = min(1.0, safe_w / max(bw_test, 1e-6), safe_h / max(bh_test, 1e-6))
+            
+            new_bw = bw_test * corr_scale
+            new_bh = bh_test * corr_scale
+            
+            # 计算修补后的中心点应在哪，确保无论原矩阵平移多远，纠偏后都在安全区内
+            valid_cx_min = margin_x + new_bw / 2.0
+            valid_cx_max = w_orig - margin_x - new_bw / 2.0
+            valid_cy_min = margin_y + new_bh / 2.0
+            valid_cy_max = h_orig - margin_y - new_bh / 2.0
+            
+            # 消除因浮点误差导致的区间倒置
+            valid_cx_min, valid_cx_max = min(valid_cx_min, valid_cx_max), max(valid_cx_min, valid_cx_max)
+            valid_cy_min, valid_cy_max = min(valid_cy_min, valid_cy_max), max(valid_cy_min, valid_cy_max)
+            
+            new_cx = np.clip(cx_test, valid_cx_min, valid_cx_max)
+            new_cy = np.clip(cy_test, valid_cy_min, valid_cy_max)
+            
+            # 构建修正矩阵：先移回原点进行缩放修正，再移动到合法的中心
+            T_back = np.array([[1, 0, -cx_test], [0, 1, -cy_test], [0, 0, 1]], dtype=np.float32)
+            S_corr = np.array([[corr_scale, 0, 0], [0, corr_scale, 0], [0, 0, 1]], dtype=np.float32)
+            T_forward = np.array([[1, 0, new_cx], [0, 1, new_cy], [0, 0, 1]], dtype=np.float32)
+            
+            M_corr = T_forward @ S_corr @ T_back
+            
+            # 叠加纠偏矩阵
+            M_total = M_corr @ M_total
+
+        # ================= 4. 一次性执行所有坐标映射 =================
+        aug_img = cv2.warpPerspective(aug_img, M_total, (w_orig, h_orig), borderValue=(0, 0, 0))
         frame_mask = cv2.warpPerspective(np.ones((h_orig, w_orig), dtype=np.float32), M_total, (w_orig, h_orig), flags=cv2.INTER_NEAREST, borderValue=0)
 
         for lab in aug_labels:
             lab['pts'] = cv2.perspectiveTransform(np.array([lab['pts']], dtype=np.float32), M_total)[0]
 
-        # ================= 4. 后置动态生成目标蒙版 =================
-        # 等点位全部落定后，基于最终的物理坐标生成拉伸 ROI。彻底避免透视畸变引发的对角线撕裂。
+        # ================= 5. 后置动态生成目标蒙版 =================
         roi_mask = np.zeros((h_orig, w_orig), dtype=np.float32)
         for lab in aug_labels:
             expanded_hull = get_expanded_roi(lab['pts'], cfg.roi_h_exp, cfg.roi_w_exp)
             cv2.fillPoly(roi_mask, [expanded_hull], 1.0)
         roi_mask = cv2.dilate(roi_mask, np.ones((7, 7), np.uint8), iterations=1)
 
-    # ================= 5. 背景融合与遮挡 =================
+    # ================= 6. 背景融合与遮挡 =================
     if bg_paths and random.random() < cfg.bg_replace_prob:
         blend_mask = roi_mask if aug_labels else np.zeros((h_orig, w_orig), dtype=np.float32)
     else:
         blend_mask = frame_mask if aug_labels else np.ones((h_orig, w_orig), dtype=np.float32)
 
-    # 在 blend_mask 上直接挖洞透出背景，模拟物理遮挡
     if aug_labels and random.random() < cfg.occ_prob:
         radius = min(w_orig, h_orig) * cfg.occ_radius_pct
         for lab in aug_labels:
@@ -264,7 +314,7 @@ def process_data(img, labels, cfg, bg_paths: list = None):
     blend_3d = np.expand_dims(blend_mask, axis=-1)
     aug_img = (aug_img.astype(np.float32) * blend_3d + bg_img.astype(np.float32) * (1 - blend_3d)).astype(np.uint8)
 
-    # ================= 6. 最终画质劣化与边界检查 =================
+    # ================= 7. 最终画质劣化与边界检查 =================
     if random.random() < cfg.blur_prob:
         ksize = random.choice(cfg.blur_ksize)
         aug_img = cv2.blur(aug_img, (ksize, ksize))
@@ -291,6 +341,8 @@ def process_data(img, labels, cfg, bg_paths: list = None):
 
     # ================= 测试代码 =================
 if __name__ == "__main__":
+    import yaml  # 确保导入了 yaml 模块
+
     def parse_labels_for_test(label_path):
         parsed = []
         with open(label_path, 'r') as f:
@@ -305,6 +357,40 @@ if __name__ == "__main__":
         
     cfg = AugmentConfig()
     
+    # 1. 从 config.yaml 动态加载参数范围与设定
+    yaml_path = Path("config.yaml")
+    if yaml_path.exists():
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            try:
+                data = yaml.safe_load(f)
+                aug_data = data.get('kielas_rm_train', {}).get('dataset', {}).get('augment', {})
+                if aug_data:
+                    for k, v in aug_data.items():
+                        if hasattr(cfg, k):
+                            # 将长度为2的list转为tuple (兼容 range 参数)
+                            if isinstance(v, list) and len(v) == 2 and k != 'blur_ksize':
+                                v = tuple(v)
+                            setattr(cfg, k, v)
+                print(f"✅ 已成功从 {yaml_path} 加载变换参数。")
+            except Exception as e:
+                print(f"❌ 读取 config.yaml 失败: {e}，将使用默认参数。")
+    else:
+        print(f"⚠️ 未找到 {yaml_path}，将使用默认参数。")
+
+    # 2. 强制将所有执行概率设为 1.0 (确保每张图都完整经历所有增强变换)
+    cfg.brightness_prob = 1.0
+    cfg.blur_prob = 1.0
+    cfg.hsv_prob = 1.0
+    cfg.noise_prob = 1.0
+    cfg.bloom_prob = 1.0
+    cfg.flip_prob = 1.0
+    cfg.scale_prob = 1.0
+    cfg.rotate_prob = 1.0
+    cfg.translate_prob = 1.0
+    cfg.perspective_prob = 1.0
+    cfg.bg_replace_prob = 1.0
+    cfg.occ_prob = 1.0
+    
     dataset_dir = Path("./data/balance")
     train_images = list((dataset_dir / "0" / "photos").glob("*.jpg"))
     train_labels_dir = dataset_dir / "0" / "labels"
@@ -318,7 +404,7 @@ if __name__ == "__main__":
     out_dir = Path("./data/test/augment")
     out_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"提取了 {len(test_samples)} 张图片准备测试...")
+    print(f"提取了 {len(test_samples)} 张图片准备测试极限综合增强...")
     
     for i, img_path in enumerate(test_samples):
         img = cv2.imread(str(img_path))
