@@ -219,3 +219,5 @@ tmp/
 model_*/
 exp*/
 export_*/
+
+negative_*/

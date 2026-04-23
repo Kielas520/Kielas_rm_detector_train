@@ -1,4 +1,8 @@
 kielas_rm_train:
+  negative_sampler:
+    video_path: "D:\\Download\\negative.mp4"
+    export_dir: "./data/hard_negatives"
+    frame_step: 5  # 每隔多少帧抽取一次
   dataset:
     raw_dir: "./data/raw"      # 确保本地有这个目录
     purify_dir: "~/autodl-fs/purify"
