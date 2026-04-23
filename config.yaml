@@ -9,33 +9,33 @@ kielas_rm_train:
 
     augment:
       # --- 基础与光学增强 (赛场极限光照模式) ---
-      brightness_prob: 0.9        # 几乎每张图都要经历光照重采样
+      brightness_prob: 0.5        # 几乎每张图都要经历光照重采样
       brightness_range: [0.2, 4.5] # 极值拉满：0.2模拟全黑死角只剩残光，3.5模拟大场地射灯贴脸导致的严重过曝失真
-      blur_prob: 0.7              # 疯狂小陀螺/高速甩头拖影模拟
+      blur_prob: 0.5              # 疯狂小陀螺/高速甩头拖影模拟
       blur_ksize: [3, 5, 7, 9, 11] # 增加 9 和 11 大核模糊，强迫网络在极度糊化的像素中找中心
-      hsv_prob: 0.8               
+      hsv_prob: 0.3               
       hsv_h_gain: 0.010           # 收紧色相扰动：不管怎么变态，死保红蓝阵营特征绝对不反转
-      hsv_s_gain: 0.7             # 严重褪色模拟，应对不同场地光源色温和工业相机偏色
-      hsv_v_gain: 0.8             # 极限明暗反差
+      hsv_s_gain: 0.3             # 严重褪色模拟，应对不同场地光源色温和工业相机偏色
+      hsv_v_gain: 0.3             # 极限明暗反差
       noise_prob: 0.7             # 模拟极暗环境下，工业相机拉高增益产生的满屏高频雪花噪点
-      bloom_prob: 0.8             # 强迫网络在严重的 LED 物理光晕中定位灯条真实边界
+      bloom_prob: 0.3             # 强迫网络在严重的 LED 物理光晕中定位灯条真实边界
       bloom_prob_area_range: [0.5, 0.8] # 光晕相对于板子面积的比例
       
       # --- 几何变换增强 (终极形变模式) ---
-      flip_prob: 0.5              # 彻底放开镜像，相当于数据量直接翻倍
-      scale_prob: 0.9             # 配合你刚修复的 Scale 逻辑，疯狂折磨多尺度特征金字塔
+      flip_prob: 0.3              # 彻底放开镜像，相当于数据量直接翻倍
+      scale_prob: 0.5             # 配合你刚修复的 Scale 逻辑，疯狂折磨多尺度特征金字塔
       roi_h_exp: 2.2
       roi_w_exp: 1.1
       scale_range: [0.0009, 0.1]     # 从芝麻大小(几十像素)到糊脸(占满半个屏幕)，让每个 Stride 的网格都被强制激活
-      rotate_prob: 0.8            
+      rotate_prob: 0.3            
       rotate_range: [-45, 45]     # 模拟飞坡、翻车、剧烈碰撞以及极端云台俯仰角带来的旋转
-      translate_prob: 0.8         
-      translate_range: 0.4        # 把目标逼到视野绝对边缘，只露出一半，锻炼截断识别能力
-      perspective_prob: 0.8       # 实战基本没有正脸，透视形变拉满
+      translate_prob: 0.3         
+      translate_range: 0.3        # 把目标逼到视野绝对边缘，只露出一半，锻炼截断识别能力
+      perspective_prob: 0.3       # 实战基本没有正脸，透视形变拉满
       perspective_factor: 0.1    # 极度扭曲，强迫网络学习四个角的拓扑约束，彻底粉碎它对固定长宽比的记忆
 
       # --- 背景替换增强 (彻底斩断上下文依赖) ---
-      bg_replace_prob: 0.85       # 85%概率处于随机背景中，彻底剥离对机器人底盘、麦轮特征的过拟合
+      bg_replace_prob: 0.6       # 85%概率处于随机背景中，彻底剥离对机器人底盘、麦轮特征的过拟合
       bg_dir: "./background"      
       
       # --- 遮挡增强 (战损与枪管遮挡模拟) ---
@@ -50,7 +50,8 @@ kielas_rm_train:
   train:
     device: "cuda"              # 可选: "auto", "cuda", "cpu"
     batch_size: 128
-    epochs: 100
+    prefetch_factor: 12            # 预取 批次 ，决定每次从硬盘读取多少数据
+    epochs: 200
     weight_decay: 0.01        # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -60,9 +61,8 @@ kielas_rm_train:
     continue:
       path: "./model_res/best_model.pth"
 
-    cache_loader:
-      load: true
-      device: 'cpu'
+    # --- 新增：半在线洗牌频率 ---
+    shuffle_interval: 50  # 每 5 轮重新随机生成一次不同的增强数据
     
     optimizer:
       base_lr: 0.0002
@@ -86,7 +86,7 @@ kielas_rm_train:
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
-      num_workers: 0 # 数据搬运到cpu了，你开多线程纯有病
+      num_workers: 16
       # 对应 stride [8, 16, 32]
       # Stride 8  负责 0-64 像素 (远)
       # Stride 16 负责 48-128 像素 (中)
@@ -147,7 +147,7 @@ kielas_rm_export:
 
 kielas_rm_demo:
   # 相机类型可选: "usb" (标准UVC相机), "hik" (海康工业相机)
-  camera_type: "hik" 
+  camera_type: "usb" 
   # 相机索引或视频文件路径
   camera_index: 0
   

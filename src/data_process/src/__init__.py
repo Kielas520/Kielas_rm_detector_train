@@ -4,7 +4,6 @@
 from .purify import purify_dataset_pipeline
 from .balance import balance_dataset_pipeline
 from .split import split_dataset_pipeline
-from .augment import run_augment_pipeline, AugmentConfig
 from .visiualize import visualize_dataset
 
 # 2. 定义三个逻辑分分组（即你想要的“三个包”）
@@ -19,8 +18,6 @@ PREPROCESS = [
 # 组二：流水线构建包 (Pipeline)
 PIPELINE = [
     'split_dataset_pipeline', 
-    'run_augment_pipeline', 
-    'AugmentConfig'
 ]
 
 # 组三：可视化与分析包 (Analysis)

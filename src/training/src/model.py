@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
 
 def keypoint_nms(pts, scores, dist_thresh=15.0):
     """
