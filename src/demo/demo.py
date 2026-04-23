@@ -97,7 +97,9 @@ def process_multi_scale_preds(preds, strides, input_size, reg_max, conf_thresh, 
 def draw_and_extract(frame, dets, orig_shape, input_size):
     orig_h, orig_w = orig_shape
     scale_x, scale_y = orig_w / input_size[0], orig_h / input_size[1]
-    color_red, color_black = (0, 0, 255), (0, 0, 0)
+    color_red = (0, 0, 255)
+    color_blue = (255, 0, 0)
+    color_black = (0, 0, 0)
     info_list = []
 
     for det in dets:
@@ -111,17 +113,20 @@ def draw_and_extract(frame, dets, orig_shape, input_size):
         cx, cy = int(np.mean(pts[:, 0])), int(np.mean(pts[:, 1]))
         info_list.append(f"{cls_id}, ({cx}, {cy})")
         
-        for p in pts: cv2.circle(frame, tuple(p), 4, color_red, -1)
-        cv2.line(frame, tuple(pts[0]), tuple(pts[1]), color_red, 2)
-        cv2.line(frame, tuple(pts[2]), tuple(pts[3]), color_red, 2)
+        # 判断颜色：ID小于6为红色，其他（大于等于6）为蓝色
+        current_color = color_red if cls_id < 6 else color_blue
+        
+        for p in pts: cv2.circle(frame, tuple(p), 4, current_color, -1)
+        cv2.line(frame, tuple(pts[0]), tuple(pts[1]), current_color, 2)
+        cv2.line(frame, tuple(pts[2]), tuple(pts[3]), current_color, 2)
         
         text = f"ID:{cls_id} | {score:.2f}"
         (tw, th), bl = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         tx, ty = cx + 20, cy - 20
-        cv2.rectangle(frame, (tx-3, ty-th-3), (tx+tw+3, ty+bl+3), color_red, 1)
+        cv2.rectangle(frame, (tx-3, ty-th-3), (tx+tw+3, ty+bl+3), current_color, 1)
         cv2.rectangle(frame, (tx-2, ty-th-2), (tx+tw+2, ty+bl+2), color_black, -1)
-        cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_red, 1)
-        cv2.line(frame, (cx, cy), (tx-3, ty-th//2), color_red, 1)
+        cv2.putText(frame, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, current_color, 1)
+        cv2.line(frame, (cx, cy), (tx-3, ty-th//2), current_color, 1)
 
     return frame, info_list
 
