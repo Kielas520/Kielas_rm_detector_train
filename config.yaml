@@ -14,39 +14,37 @@ kielas_rm_train:
       max_samples_per_class: 3000
 
     augment:
-      # --- 基础与光学增强 (赛场极限光照模式) ---
-      brightness_prob: 0.8        # 几乎每张图都要经历光照重采样
-      brightness_range: [0.2, 4.5] # 极值拉满：0.2模拟全黑死角只剩残光，3.5模拟大场地射灯贴脸导致的严重过曝失真
-      blur_prob: 0.7              # 疯狂小陀螺/高速甩头拖影模拟
-      blur_ksize: [3, 5, 7, 9, 11] # 增加 9 和 11 大核模糊，强迫网络在极度糊化的像素中找中心
-      hsv_prob: 0.4               
-      hsv_h_gain: 0.01           # 收紧色相扰动：不管怎么变态，死保红蓝阵营特征绝对不反转
-      hsv_s_gain: 0.3             # 严重褪色模拟，应对不同场地光源色温和工业相机偏色
-      hsv_v_gain: 0.3             # 极限明暗反差
-      noise_prob: 0.7             # 模拟极暗环境下，工业相机拉高增益产生的满屏高频雪花噪点
-      bloom_prob: 0.4             # 强迫网络在严重的 LED 物理光晕中定位灯条真实边界
+      # --- 基础与光学增强 (适度放宽，避免特征完全损毁) ---
+      brightness_prob: 0.8        
+      brightness_range: [0.3, 3.0] # 【修改】回调过曝上限。3.0已足够模拟射灯，4.5会导致彻底白化
+      blur_prob: 0.7              
+      blur_ksize: [3, 5, 7, 9, 11]
+      hsv_prob: 0.4              
+      hsv_h_gain: 0.01           
+      hsv_s_gain: 0.3             
+      hsv_v_gain: 0.3             
+      noise_prob: 0.7             
+      bloom_prob: 0.2              # 【修改】降低光晕概率，过度泛光会严重干扰角点定位
 
-      # --- 几何变换增强 (终极形变模式) ---
-      flip_prob: 0.4              # 彻底放开镜像，相当于数据量直接翻倍
-      scale_prob: 0.6             # 配合你刚修复的 Scale 逻辑，疯狂折磨多尺度特征金字塔
+      # --- 几何变换增强 (终极形变模式微调) ---
+      flip_prob: 0.4              
+      scale_prob: 0.6             
       roi_h_exp: 2.1
       roi_w_exp: 1.1
-      scale_range: [0.0009, 0.1]     # 从芝麻大小(几十像素)到糊脸(占满半个屏幕)，让每个 Stride 的网格都被强制激活
+      scale_range: [0.0009, 0.1]    
       rotate_prob: 0.6            
-      rotate_range: [-45, 45]     # 模拟飞坡、翻车、剧烈碰撞以及极端云台俯仰角带来的旋转
+      rotate_range: [-45, 45]     
       translate_prob: 0.5         
-      translate_range: 0.6        # 把目标逼到视野绝对边缘，只露出一半，锻炼截断识别能力
-      perspective_prob: 0.5       # 实战基本没有正脸，透视形变拉满
-      perspective_factor: 0.30    # 极度扭曲，强迫网络学习四个角的拓扑约束，彻底粉碎它对固定长宽比的记忆
+      translate_range: 0.6        
+      perspective_prob: 0.5       
+      perspective_factor: 0.20     # 【修改】从 0.30 降至 0.20，防止四个角点交叉产生多边形自相交
 
-      # --- 背景替换增强 (彻底斩断上下文依赖) ---
-      bg_replace_prob: 0.85       # 85%概率处于随机背景中，彻底剥离对机器人底盘、麦轮特征的过拟合
+      # --- 背景替换增强与遮挡 ---
+      bg_replace_prob: 0.85       
       bg_dir: "./background"      
-      
-      # --- 遮挡增强 (战损与枪管遮挡模拟) ---
-      occ_prob: 0.8               # 满屏飞弹、枪管遮挡模拟
-      occ_radius_pct: 0.4         # 扩大遮挡块生成范围
-      occ_size_pct: [0.02, 0.1]  # 新增项：生成极端细长条遮挡(枪管)和大面积遮挡，逼迫网络通过单根残缺灯条脑补整体
+      occ_prob: 0.8               
+      occ_radius_pct: 0.4         
+      occ_size_pct: [0.02, 0.1]  
 
     split:
       val: 0.2
@@ -57,53 +55,43 @@ kielas_rm_train:
     num_classes: 13
     negative_class_id: 12
     batch_size: 128
-    prefetch_factor: 12            # 预取 批次 ，决定每次从硬盘读取多少数据
+    prefetch_factor: 12         # 预取 批次 ，决定每次从硬盘读取多少数据
     epochs: 200
-    weight_decay: 0.015        # 正则化惩罚力度 （0.01 - 0.05）
+    weight_decay: 0.03          # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
-    strides: [8, 16, 32] # 缩放比例
-    reg_max: 16                 # <--- 新增：关键点分布偏移网格范围参数 (预测范围)，决定了网络有没有能力**“够得着”**占据大画幅的近距离装甲板角
+    strides: [8, 16, 32]        # 缩放比例
+    reg_max: 16                 # 关键点分布偏移网格范围参数
 
     continue:
       path: "./model_res/best_model.pth"
 
-    # --- 新增：半在线洗牌频率 ---
-    shuffle_interval: 60  # 每 50 轮重新随机生成一次不同的增强数据
-    
+    shuffle_interval: 5         # 【保持】每 5 轮重新生成一次增强数据，打散数据分布
     optimizer:
-      base_lr: 0.0005
-      betas: [0.940, 0.999] # 一阶矩估计的指数衰减率 将 0.9 改为 0.940
+      base_lr: 0.0003           # 【保持】稍低的基础学习率以稳定震荡
+      betas: [0.940, 0.999] 
     
     scheduler:
-      T_0: 20
-      T_mult: 2
-    # 新增后处理配置块
+      T_0: 200                  # 【保持】取消重启机制，直接退火至结束
+      T_mult: 1
+    
     post_process:
-      # # 置信度阈值（通常是 conf_threshold = 0.5）。
-      # 在前几个 epoch，模型还在“摸黑走路”，它输出的目标置信度可能只有 0.1 或者 0.2。
-      # 既然连 0.5 的及格线都没到，NMS（非极大值抑制）阶段就把所有预测框全过滤掉了，相当于模型交了“白卷”，PCK 自然就是 0。
       conf_threshold: 0.5 
       kpt_dist_thresh: 15.0
 
     data:
       class_id: [0, 2, 5, 6, 8, 11, 12]
-      # --- 数据集路径与加载配置 ---
       train_img_dir: "./data/datasets/images/train"
       train_label_dir: "./data/datasets/labels/train"
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
       num_workers: 16
-      # 对应 stride [8, 16, 32]
-      # Stride 8  负责 0-64 像素 (远)
-      # Stride 16 负责 48-128 像素 (中)
-      # Stride 32 负责 112-9999 像素 (近)
       scale_ranges: [[0, 23], [20, 90], [87, 416]]
 
     # --- 损失函数权重 ---
     loss:
       lambda_pose: 5.0
-      lambda_cls: 4.0   # 新增分类损失的权重
+      lambda_cls: 4.0   
       alpha: 0.25
       gamma: 2.0
       omega: 10.0
@@ -111,17 +99,16 @@ kielas_rm_train:
 
     pck:
       target_in_range_dist: 10.0
-      max_pixel_threshold: 5.0 # 根据网格计算比较适合的值，416x416 的图片大小对应 52x52 个网格，每个网格大小为 416/52 = 8，所以最好超过半个网格的大小，设定为 5
+      max_pixel_threshold: 5.0 
     
-    # 新增：综合评估得分权重配置
+    # 综合评估得分权重配置
     metric_weights:
       pck: 0.65        # PCK 占总分的权重
       id_acc: 0.35     # 类别 ID 准确率占总分的权重
 
-    # --- 新增：提前停止机制 ---
     early_stopping:
-      enabled: false        # 是否开启自动停止
-      min_score: 0.98        # 验证集 pck 高于此值就停止训练
+      enabled: false        
+      min_score: 0.98        
 
   tools:
     background:
@@ -136,39 +123,29 @@ kielas_rm_train:
         https: "http://127.0.0.1:7897"
 
 kielas_rm_export:
-  # 权重文件路径
   weights: "./model_res/best_model.pth"
-  num_classes: 13                 # <--- 【修改】改成 13
+  num_classes: 13                 
   negative_class_id: 12
-  # 导出模型存放目录
   output_dir: "./export_res"
-  # 导出格式列表，支持 "onnx", "torchscript"
   formats: 
     - "onnx"
     - "torchscript"
-  # 模型输入尺寸 [宽, 高]
   input_size: [416, 416]
   
   onnx:
     opset: 18
-    # 是否开启极致轻量化 (需要安装 onnx 和 onnx-simplifier)
     simplify: true
 
 kielas_rm_demo:
-  # 相机类型可选: "usb" (标准UVC相机), "hik" (海康工业相机)
   camera_type: "hik" 
-  # 相机索引或视频文件路径
   camera_index: 0
-  
-  # 海康相机专用配置 (单位: us)
   hik_exposure: 5000
   hik_gain: 10
-  
-  # 原有配置保持不变...
   model_type: "onnx" 
   model_path: "./export_res/best_model.onnx"
   device: "cuda"
-  num_classes: 13                 # <--- 【修改】改成 13
+  num_classes: 13
+  negative_class_id: 12                 
   input_size: [416, 416]
   strides: [8, 16, 32]
   conf_threshold: 0.7
