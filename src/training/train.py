@@ -634,6 +634,8 @@ def main():
                     torch.save(model.state_dict(), save_dir / "best_model.pth")
                     console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，模型已保存。[/green]")
                 
+                # 新增：每个 Epoch 结束后实时更新本地保存的曲线图片
+                save_training_curves(history, save_dir)
                 progress.update(epoch_task, advance=1)
                 
                 if auto_stop_enabled and val_score >= min_score:
