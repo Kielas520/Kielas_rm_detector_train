@@ -33,6 +33,42 @@ from src.training.src import *
 
 console = Console()
 
+class TrainingSessionManager:
+    """用于管理训练状态与强制保存的上下文管理器"""
+    def __init__(self, model, save_dir, history, console):
+        self.model = model
+        self.save_dir = save_dir
+        self.history = history
+        self.console = console
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is KeyboardInterrupt:
+            self.console.print("\n[bold red]⚠️ 接收到 Ctrl+C 中断信号！正在终止训练并执行保存工作...[/bold red]")
+        elif exc_type is not None:
+            self.console.print(f"\n[bold red]❌ 训练因为异常中断: {exc_type.__name__}，正在尝试抢救保存模型...[/bold red]")
+
+        # 无论正常结束、Ctrl+C，还是其他异常，都会执行以下保存逻辑
+        torch.save(self.model.state_dict(), self.save_dir / "last_model.pth")
+        
+        # 保存训练曲线和日志
+        save_training_curves(self.history, self.save_dir)
+        log_file = self.save_dir / "train_log.txt"
+        with log_file.open("w", encoding="utf-8") as f:
+            f.write("Epoch\tLR\tTotal_Loss\tPose_Loss\tCls_Loss\tVal_PCK\n")
+            for i in range(len(self.history['val_pck'])):
+                f.write(f"{i+1}\t{self.history['lr'][i]:.6f}\t{self.history['train_total'][i]:.6f}\t"
+                        f"{self.history['train_pose'][i]:.6f}\t{self.history['train_cls'][i]:.6f}\t{self.history['val_pck'][i]:.6f}\n")
+
+        if exc_type is KeyboardInterrupt:
+            # 返回 True 表示抑制该异常，阻止它继续向外抛出
+            # 这样程序不会直接崩溃退出，而是能继续往下走到清理显存和输出可视化图片的阶段
+            return True
+            
+        return False # 其他错误则正常抛出堆栈
+
 def plot_and_save_curve(data, epochs, title, ylabel, save_path, color='b'):
     """通用单图绘制函数"""
     plt.figure(figsize=(10, 6))
@@ -531,8 +567,10 @@ def main():
             f"[bold green]Overall Training | Stage 0 | Next Shuffle: {shuffle_interval} epochs", 
             total=epochs
         )
+        
         # ==================== 【修改开始】 ====================
-        try:
+        # 使用上下文管理器包裹训练流程
+        with TrainingSessionManager(model, save_dir, history, console):
             for epoch in range(1, epochs + 1):
                 if epoch > 1 and (epoch - 1) % shuffle_interval == 0:
                     with shared_stage.get_lock():
@@ -555,7 +593,6 @@ def main():
                     aug_pipeline=aug_pipeline                       
                 )
                 
-                # 【修复 5】：传递给验证集过程
                 val_loss, val_pck, val_id_acc = validate(
                     model, val_loader, criterion, device, epoch, progress, 
                     input_size, strides, reg_max, conf_thresh, kpt_dist_thresh, pck_cfg, num_classes
@@ -602,25 +639,17 @@ def main():
                 if auto_stop_enabled and val_score >= min_score:
                     console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
                     break
-        except KeyboardInterrupt:
-            # 捕获 Ctrl+C 中断信号
-            console.print("\n[bold red]⚠️ 接收到 Ctrl+C 中断信号！正在退出训练循环并执行保存工作...[/bold red]")
+                    
         # ==================== 【修改结束】 ====================
-        torch.save(model.state_dict(), save_dir / "last_model.pth")
-        save_training_curves(history, save_dir)
-        
-        log_file = save_dir / "train_log.txt"
-        with log_file.open("w", encoding="utf-8") as f:
-            f.write("Epoch\tLR\tTotal_Loss\tPose_Loss\tCls_Loss\tVal_PCK\n")
-            for i in range(len(history['val_pck'])):
-                f.write(f"{i+1}\t{history['lr'][i]:.6f}\t{history['train_total'][i]:.6f}\t"
-                        f"{history['train_pose'][i]:.6f}\t{history['train_cls'][i]:.6f}\t{history['val_pck'][i]:.6f}\n")
                 
+        # 此时程序走出 with TrainingSessionManager 块，无论是正常还是中断，该存的已经存了。
+        # 接下来正常清理 Dataloader 并执行后续代码
         del train_loader
         del val_loader
         gc.collect()
 
         console.print("\n[bold cyan]正在生成识别效果可视化图片...[/bold cyan]")
+        # ... 下方可视化代码保持不变 ...
 
         best_model_path = save_dir / "best_model.pth"
         if best_model_path.exists():

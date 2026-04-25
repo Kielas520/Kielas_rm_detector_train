@@ -34,7 +34,8 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-bce_loss)
         
         # 为正负样本正确分配 alpha 和 (1 - alpha)
-        alpha_factor = torch.where(targets == 1.0, self.alpha, 1.0 - self.alpha)
+        # 【修改点】：将 targets == 1.0 改为 targets > 0.5
+        alpha_factor = torch.where(targets > 0.5, self.alpha, 1.0 - self.alpha)
         focal_loss = alpha_factor * (1 - pt) ** self.gamma * bce_loss
 
         # 新增核心逻辑：如果在对应通道上存在权重，施加乘性惩罚
@@ -121,7 +122,8 @@ class RMDetLoss(nn.Module):
         pos_mask = conf_mask & (target_class_long.squeeze(1) != self.negative_class_id)
         
         target_cls_onehot = torch.zeros_like(pred_cls)
-        target_cls_onehot.scatter_(1, target_class_long, 0.9)
+        # 【修改点】：将 0.9 改为 1.0
+        target_cls_onehot.scatter_(1, target_class_long, 1.0)
         target_cls_onehot = target_cls_onehot * conf_mask.unsqueeze(1).float()
         
         loss_cls_sum = self.focal_loss(pred_cls, target_cls_onehot)

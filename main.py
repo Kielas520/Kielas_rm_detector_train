@@ -41,13 +41,23 @@ class WorkflowTerminal:
     def run_script(self, module_name):
         """使用 subprocess -m 模式调用模块"""
         try:
-            # 这里的 module_name 应该是 "src.demo.demo" 这种格式
-            # sys.executable 指向当前的 Python 解释器
-            subprocess.run([sys.executable, "-m", module_name], check=True)
-        except subprocess.CalledProcessError as e:
-            console.print(f"[red]模块执行失败，退出码: {e.returncode}[/red]")
+            # 改用 Popen，这样我们能灵活控制父进程的等待逻辑
+            process = subprocess.Popen([sys.executable, "-m", module_name])
+            process.wait()
         except KeyboardInterrupt:
-            console.print("\n[yellow]操作已被用户中断。[/yellow]")
+            # 按下 Ctrl+C 时，父子进程会同时收到信号。
+            # 子进程 (train.py) 此时已经触发了 __exit__ 正在疯狂保存。
+            # 父进程 (main.py) 收到信号后进入这个 except 块，在这里老老实实等子进程存完。
+            console.print("\n[yellow]⏳ 检测到中断，正在等待训练进程保存权重与可视化，请稍候...[/yellow]")
+            try:
+                process.wait()  # 再次等待，直到子进程安全走完流程退出
+            except KeyboardInterrupt:
+                # 如果你急眼了，又连按了一次 Ctrl+C，那就连保存都不管了，直接强杀
+                console.print("\n[red]💥 连续中断，强制击杀进程！[/red]")
+                process.kill()
+                
+        if process.returncode != 0 and process.returncode is not None:
+            console.print(f"[dim]独立进程已结束 (退出码: {process.returncode})[/dim]")
 
     def run(self):
         while True:
