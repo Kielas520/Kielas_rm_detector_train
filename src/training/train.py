@@ -440,7 +440,7 @@ def main():
     w_id = float(metric_weights.get('id_acc', 0.4))
     early_stop_cfg = train_cfg.get('early_stopping', {})
     auto_stop_enabled = early_stop_cfg.get('enabled', False)
-    min_score = float(early_stop_cfg.get('min_score', 0.98))
+    patience = int(early_stop_cfg.get('patience', 60))  # 读取耐心值
 
     device = torch.device("cuda" if torch.cuda.is_available() and train_cfg['device'] == 'auto' else train_cfg['device'])
     save_dir = Path(train_cfg.get('save_dir', "./model_res"))
@@ -605,6 +605,8 @@ def main():
 
     best_val_score = 0.0    
 
+    epochs_without_improvement = 0  # 【新增】：用于记录连续未提升的 Epoch 数量
+
     console.print("[bold green]开始训练...[/bold green]")
     
     with Progress(
@@ -686,15 +688,17 @@ def main():
                 
                 if val_score > best_val_score:
                     best_val_score = val_score
-                    # 【关键修改 2】：此时保存的是泛化最好的 EMA 权重，而不是抖动的实时权重
+                    epochs_without_improvement = 0  # 【新增】：一旦破纪录，耐心值计数器清零
                     torch.save(ema.ema.state_dict(), save_dir / "best_model.pth")
                     console.print(f"[green]  -> 发现更高综合得分: {val_score:.4f}，稳健 EMA 模型已保存。[/green]")
+                else:
+                    epochs_without_improvement += 1 # 【新增】：没破纪录，计数器 +1
                 
                 save_training_curves(history, save_dir)
                 progress.update(epoch_task, advance=1)
                 
-                if auto_stop_enabled and val_score >= min_score:
-                    console.print(f"\n[bold yellow]验证集综合得分 ({val_score:.4f}) 已达到设定的停止阈值，提前终止训练。[/bold yellow]")
+                if auto_stop_enabled and epochs_without_improvement >= patience:
+                    console.print(f"\n[bold yellow]🛑 触发早停：模型验证得分已连续 {patience} 个 Epoch 未创出新高，认为已收敛，提前终止训练。[/bold yellow]")
                     break
                     
         # ==================== 【修改结束】 ====================

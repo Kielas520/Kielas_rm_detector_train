@@ -83,7 +83,7 @@ kielas_rm_train:
     negative_class_id: 12
     batch_size: 128
     prefetch_factor: 12         # 预取 批次 ，决定每次从硬盘读取多少数据
-    epochs: 200
+    epochs: 300
     weight_decay: 0.03          # 正则化惩罚力度 （0.01 - 0.05）
     save_dir: "./model_res"
     input_size: [416, 416]
@@ -99,8 +99,8 @@ kielas_rm_train:
       betas: [0.940, 0.999] 
     
     scheduler:
-      T_0: 100                  # 【保持】取消重启机制，直接退火至结束
-      T_mult: 2
+      T_0: 300                  # 【保持】取消重启机制，直接退火至结束
+      T_mult: 1
     
     post_process:
       conf_threshold: 0.5 
@@ -134,8 +134,8 @@ kielas_rm_train:
       id_acc: 0.35     # 类别 ID 准确率占总分的权重
 
     early_stopping:
-      enabled: false        
-      min_score: 0.98        
+      enabled: true          # 【修改】：开启早停
+      patience: 60           # 【修改】：如果连续 60 个 Epoch 分数没破纪录，直接停止    
 
 kielas_rm_export:
   weights: "./model_res/best_model.pth"
