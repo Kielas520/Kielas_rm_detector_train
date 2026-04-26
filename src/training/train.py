@@ -129,7 +129,8 @@ def save_training_curves(history, save_dir):
     plot_and_save_curve(history['train_pose'], epochs, 'Pose (Keypoints) Loss', 'Loss', save_dir / "loss_pose.png", 'purple')
     plot_and_save_curve(history['train_cls'], epochs, 'Classification Loss', 'Loss', save_dir / "loss_cls.png", 'brown')
     plot_and_save_curve(history['val_pck'], epochs, 'Validation PCK@0.5', 'PCK', save_dir / "val_pck.png", 'r')
-
+    plot_and_save_curve(history['val_id_acc'], epochs, 'Validation ID Accuracy', 'Accuracy', save_dir / "val_id_acc.png", 'orange')
+    plot_and_save_curve(history['val_score'], epochs, 'Overall Validation Score', 'Score', save_dir / "val_score.png", 'green')
 def train_one_epoch(model, ema, dataloader, optimizer, criterion, device, epoch, progress, scaler, current_stage, processed_counter, batch_size, total_samples, aug_pipeline):
     model.train()
     
