@@ -84,7 +84,7 @@ def draw_and_extract(frame, dets, orig_shape, input_size):
     for det in dets:
         score, cls_id = det[0], int(det[1])
         
-        # 【核心修改】：不绘制负样本
+        # 不绘制负样本
         if cls_id == 12:
             continue
             
@@ -98,35 +98,39 @@ def draw_and_extract(frame, dets, orig_shape, input_size):
         
         current_color = (0, 0, 255) if cls_id < 6 else (255, 0, 0)
         
-        # 计算两个灯条的中心坐标 (根据原代码连线逻辑，[0][1] 和 [2][3] 各为一个灯条)
+        # 计算两个灯条的中心点坐标
         center_1 = (pts[0] + pts[1]) / 2.0
         center_2 = (pts[2] + pts[3]) / 2.0
         
-        # 获取两灯条间距，并按照要求设置框宽为 1.3 倍
-        lightbar_width = np.linalg.norm(center_1 - center_2)
-        box_w = int(lightbar_width * 1.3)
+        # 宽度：两个灯条中心距的 1.3 倍
+        lightbar_dist = np.linalg.norm(center_1 - center_2)
+        box_w = int(lightbar_dist * 1.3)
         
-        # 获取灯条的 Y 轴极值作为高度参考，留出 10% 冗余确保完全包裹灯条
-        min_y, max_y = np.min(pts[:, 1]), np.max(pts[:, 1])
-        box_h = int((max_y - min_y) * 1.1)
+        # 计算两个灯条的平均长度
+        len_1 = np.linalg.norm(pts[0] - pts[1])
+        len_2 = np.linalg.norm(pts[2] - pts[3])
+        avg_lightbar_len = (len_1 + len_2) / 2.0
+        
+        # 高度：灯条平均长度的 2.2 倍
+        box_h = int(avg_lightbar_len * 2.2)
         
         # 计算水平正交框的左上和右下坐标
         tl_x, tl_y = int(cx - box_w / 2), int(cy - box_h / 2)
         br_x, br_y = int(cx + box_w / 2), int(cy + box_h / 2)
         
-        # 1. 绘制灯条和关键点 (如果仅需要框，可以注释掉这部分)
+        # 绘制灯条和关键点
         for p in pts: cv2.circle(frame, tuple(p), 4, current_color, -1)
         cv2.line(frame, tuple(pts[0]), tuple(pts[1]), current_color, 2)
         cv2.line(frame, tuple(pts[2]), tuple(pts[3]), current_color, 2)
         
-        # 2. 绘制 1.3 倍宽度的外框
+        # 绘制外框
         cv2.rectangle(frame, (tl_x, tl_y), (br_x, br_y), current_color, 2)
         
-        # 3. 在框的上方绘制 ID 和置信度
+        # 在框的上方绘制 ID 和置信度
         text = f"ID:{cls_id} | {score:.2f}"
         # 动态调整文本 Y 坐标，防止目标在画面最顶部时文本超出边界
         text_y = tl_y - 8 if tl_y - 8 > 15 else tl_y + 18
-        cv2.putText(frame, text, (tl_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, current_color, 1)
+        cv2.putText(frame, text, (tl_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.0, current_color, 4)
         
     return frame
 def main():
