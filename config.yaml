@@ -96,14 +96,14 @@ kielas_rm_train:
     shuffle_interval: 5         # 【保持】每 5 轮重新生成一次增强数据，打散数据分布
     optimizer:
       base_lr: 0.0002           # 【保持】稍低的基础学习率以稳定震荡
-      betas: [0.940, 0.999] 
+      betas: [0.900, 0.999] 
     
     ema:
       decay: 0.999 # 滤波滞留率
       tau: 480 # 预热所需要的steps 训练一批数据就一个step
 
     scheduler:
-      T_0: 300                  # 【保持】取消重启机制，直接退火至结束
+      T_0: 200                  # 【保持】取消重启机制，直接退火至结束
       T_mult: 1
     
     post_process:
@@ -117,12 +117,12 @@ kielas_rm_train:
       val_img_dir: "./data/datasets/images/val"
       val_label_dir: "./data/datasets/labels/val"
       num_workers: 16
-      scale_ranges: [[0, 140], [120, 250], [237, 640]]
+      scale_ranges: [[0, 23], [20, 90], [87, 416]]
 
     # --- 损失函数权重 ---
     loss:
-      lambda_pose: 5.0
-      lambda_cls: 4.0   
+      lambda_pose: 0.67
+      lambda_cls: 0.33   
       alpha: 0.25
       gamma: 2.0
       omega: 10.0
